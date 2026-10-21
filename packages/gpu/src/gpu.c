@@ -211,9 +211,19 @@ static void check_faults(void) {
     exit(1);
 }
 
-/* The fault buffer, made with the device. */
+/* Global arrays GPU functions read (docs/design/gpu_language.md §10): the
+   table at heap index 1 of each one's buffer and length, by its number. */
+#define GOOSE_GPU_GLOBALS 1024
+static uint32_t globalslot[GOOSE_GPU_GLOBALS];
+static int64_t globalbytes[GOOSE_GPU_GLOBALS];
+
+/* The fault buffer at heap index 0 and the globals' table at 1, made with
+   the device. */
 static int start_faults(void) {
-    return backend->buffer_create(0, 2, NULL, (int64_t)sizeof(gs_gpu_fault));
+    memset(globalslot, 0, sizeof globalslot);
+    memset(globalbytes, 0, sizeof globalbytes);
+    return backend->buffer_create(0, 2, NULL, (int64_t)sizeof(gs_gpu_fault)) &&
+           backend->buffer_create(1, 1, NULL, GOOSE_GPU_GLOBALS * 8);
 }
 
 static const goose_gpu_backend *pick_backend(void) {
@@ -341,7 +351,7 @@ uint8_t goose_gpu_open_window(goose_gpu_bytes title, int64_t width, int64_t heig
     if (!start_faults()) return 0;
     SDL_GetWindowSizeInPixels(w, &screenw, &screenh);
     /* The screen's slot, which holds each frame's image once acquired. */
-    for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS && !screenslot; s++)
+    for (uint32_t s = 2; s < GOOSE_GPU_HEAP_SLOTS && !screenslot; s++)
         if (!slotkind[s]) screenslot = s;
     slotkind[screenslot] = SLOT_TEXTURE;
     textures[screenslot].desc = (goose_gpu_texture_desc) { 0, GOOSE_GPU_BGRA8,
@@ -391,6 +401,7 @@ void goose_gpu_close(void) {
             dying[s] = 0;
         }
     backend->release(0, GOOSE_GPU_KIND_BUFFER);
+    backend->release(1, GOOSE_GPU_KIND_BUFFER);
     for (uint32_t i = 0; i < nsites; i++) free(sitetext[i]);
     free(sitetext);
     sitetext = NULL;
@@ -419,7 +430,7 @@ void goose_gpu_driver(gs_rref out) {
 }
 
 static uint32_t free_slot(void) {
-    for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++)
+    for (uint32_t s = 2; s < GOOSE_GPU_HEAP_SLOTS; s++)
         if (!slotkind[s]) return s;
     goose_gpu_fail("the resource heap is full (%d slots)", GOOSE_GPU_HEAP_SLOTS);
     return 0;
@@ -489,6 +500,35 @@ uint32_t goose_gpu_texture(goose_gpu_texture_desc d, goose_gpu_bytes data) {
     textures[slot].access = data.len ? GOOSE_GPU_ACCESS_SHADER_READ : GOOSE_GPU_ACCESS_NONE;
     textures[slot].submitted = textures[slot].access;
     return slot;
+}
+
+uint8_t goose_gpu_update_buffer(uint32_t slot, int64_t offset, goose_gpu_bytes data);
+
+/* A global array's contents, for GPU functions to read by its number
+   (gpu_global_id): copied into a buffer of its own, made again where its
+   size changed, and its table entry updated, both before the next
+   submission runs, as an update is. */
+uint8_t goose_gpu_upload(uint32_t id, goose_gpu_bytes data, int64_t count) {
+    if (!ready("gpu::upload")) return 0;
+    if (id >= GOOSE_GPU_GLOBALS || count < 0) {
+        goose_gpu_misuse("gpu::upload of global %u: at most %d globals", id, GOOSE_GPU_GLOBALS);
+        return 0;
+    }
+    uint32_t slot = globalslot[id];
+    if (slot && globalbytes[id] == data.len && data.len) {
+        if (!goose_gpu_update_buffer(slot, 0, data)) return 0;
+    } else {
+        if (slot) goose_gpu_release(slot);
+        slot = 0;
+        if (data.len) {
+            slot = goose_gpu_buffer(1, data, data.len);
+            if (!slot) return 0;
+        }
+        globalslot[id] = slot;
+        globalbytes[id] = data.len;
+    }
+    uint32_t entry[2] = { slot, slot ? (uint32_t)count : 0 };
+    return (uint8_t)backend->update_buffer(1, (int64_t)id * 8, entry, 8);
 }
 
 /* Updates (§3): complete before the next submission runs, so the whole of

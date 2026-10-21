@@ -31,10 +31,12 @@ devices that have no window, and load_texture and save_png fail.
     goose examples/sort/radix.goose   a stable radix sort of key-value pairs, checked against the CPU
     goose examples/gltf/viewer.goose  glTF PBR with image-based lighting, JPEGs decoded on the GPU
     goose examples/gltf/pathtrace.goose  the same scenes path traced with ray queries (Metal)
+    goose examples/gltf/bvh.goose     a BVH built in Goose, traced by the same function on the CPU and the GPU
     goose test/groups.goose           group memory, atomics and waves, checked against the CPU
     goose test/views.goose            a texture's mips written through views, then sampled
     goose test/language.goose         references, results, return-from and ADTs, checked against the CPU
     goose test/faults.goose -- index  a shader's failed check, reported with its line (index|divide|tag)
+    goose test/globals.goose          a linked pool uploaded byte for byte and walked on the GPU and the CPU
 
 `GOOSE_GPU_BACKEND=vulkan` picks Vulkan over Metal on a Mac, where the
 driver is KosmicKrisp; `GOOSE_GPU_VALIDATION=1` turns on Vulkan's

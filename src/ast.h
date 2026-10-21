@@ -2415,6 +2415,18 @@ struct Ast {
 
     vector<Node *> topdecls;                        // In source/import order.
     vector<VarDecl *> globals;                      // Initialization order.
+    // A global array's number among the program's globals, which the gpu
+    // package's table of uploaded globals is indexed by
+    // (docs/design/gpu_language.md §10); -1 for no global.
+    int GpuGlobalId(const VarDef *v) const {
+        int id = 0;
+        for (auto g : globals)
+            for (auto d : g->defs) {
+                if (d == v) return id;
+                id++;
+            }
+        return -1;
+    }
 
     // embed_shader's compiled blobs, compiled once by the checker and emitted
     // by codegen: a shader file's by its path as resolved from the file

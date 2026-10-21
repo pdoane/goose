@@ -215,6 +215,22 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 Error(c, cat("gpu_store_texel writes a flat value, not ", TypeStr(vv.type)));
             return VoidVal();
         }
+        case B_GPU_GLOBAL_ID: {
+            // gpu_global_id(g): the number of the global array g, which the
+            // gpu package uploads it under and GPU functions read it by
+            // (docs/design/gpu_language.md §10).
+            auto id = Is<Ident>(args[0]);
+            auto v = id ? LookupVar(id->name, id->ns) : nullptr;
+            if (!v || !v->isglobal || !v->type || v->type->kind != TY_ARRAY)
+                Error(c, "gpu_global_id takes a global array by its name");
+            CheckValue(args[0], nullptr);
+            c->rettypes.push_back(ast.inttypes[IS_U32]);
+            Val r;
+            r.type = ast.inttypes[IS_U32];
+            r.ck = CK_INT;
+            r.ival = ast.GpuGlobalId(v);
+            return r;
+        }
         case B_GPU_ATOMIC: case B_GPU_ATOMIC_CAS: {
             // gpu_atomic(op, target, v) and gpu_atomic_cas(target, compare,
             // v): an atomic change to a u32 or i32 in group memory, the old

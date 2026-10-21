@@ -120,6 +120,10 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
         }
         case B_HARDWARE_THREADS: return { "gs_hardware_threads()" };
         case B_GPU_LOAD: case B_GPU_STORE: case B_GPU_SAMPLE: case B_GPU_SAMPLE_LEVEL:
+        case B_GPU_GLOBAL_ID: {
+            auto id = Is<Ident>(c->ArgNodes()[0]);
+            return { cat(ast.GpuGlobalId(id ? id->vdef : nullptr), "u") };
+        }
         case B_GPU_TEXEL: case B_GPU_STORE_TEXEL: case B_GPU_ATOMIC: case B_GPU_ATOMIC_CAS:
             Fail(c->line, cat(BuiltinByKind(c->builtin).name, " runs on the GPU only, and this call is "
                               "reached from code the CPU runs (docs/design/gpu.md §5.2)"));

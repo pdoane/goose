@@ -65,7 +65,10 @@ struct GpuEmitter {
     string structdefs;                      // Struct declarations, in dependency order.
     string fndefs;                          // Function definitions, callees first.
     unordered_map<StructInst *, string> structnames;
-    unordered_map<FnSpec *, string> fnnames;
+    // Each function emitted, by its specialization and which reference
+    // parameters name an element of which global array (§9 of
+    // design/gpu_language.md): a variant per combination a call makes.
+    map<pair<FnSpec *, vector<VarDef *>>, string> fnnames;
     set<string> globalnames;                // Every top-level name taken.
     set<FnSpec *> inprogress;               // The functions on the emitter's stack.
     vector<FnSpec *> chain;                 // The same, in call order, for errors.
@@ -81,6 +84,10 @@ struct GpuEmitter {
         // Immutable integer locals known to lie in [0, bound): loop binders
         // and lets of bounded values (Bound).
         unordered_map<VarDef *, int64_t> bounds;
+        // Reference locals and parameters into a global array (design/
+        // gpu_language.md §9): which one; the variable holds the byte
+        // offset of what it names plus one, zero for null.
+        unordered_map<VarDef *, VarDef *> places;
         set<string> names;
         int temps = 0;
         // The destination a value-giving loop's breaks assign, innermost last.
@@ -131,6 +138,17 @@ struct GpuEmitter {
     // is a compute group's shared memory.
     static bool IsGroupShared(const TypeExpr *t) {
         return t->kind == TY_STRUCT && t->struc->st && t->struc->st->qname == "gpu::GroupShared";
+    }
+
+    // A relative reference stored as a 32-bit offset (spec §3.9): from its
+    // own field, or `in pool` from a global's start, plus one; the GPU
+    // stores and reads it as a word (design/gpu_language.md §9).
+    bool RelRef(const TypeExpr *t, Line l) {
+        if (t->kind != TY_REF || t->ref->lenstorage < 0) return false;
+        if (t->ref->lenstorage != IS_U32)
+            Fail(l, cat("relative references on the GPU are 32-bit, <u32> or <u32 in pool>, not ",
+                        TypeStr(t)));
+        return true;
     }
 
     // A fixed array T[k]: its detail, else null.
@@ -201,6 +219,7 @@ struct GpuEmitter {
         if (LimitedArray(t)) return LimitedName(t, l);
         if (t->kind == TY_ARRAY)
             Fail(l, cat("only fixed arrays run on the GPU, T[k], not ", TypeStr(t)));
+        if (RelRef(t, l)) return t->ref->pool ? "uint" : "int";
         if (t->kind == TY_REF)
             Fail(l, cat("references do not run on the GPU, except an entry point's uniform "
                         "block: ", TypeStr(t)));
@@ -233,6 +252,7 @@ struct GpuEmitter {
     // Goose's packed size of a GPU type, the stride of a buffer of it.
     int64_t PackedSize(TypeExpr *t, Line l) {
         if (t->kind == TY_BOOL) Fail(l, "bool has no layout on the GPU: use u32");
+        if (RelRef(t, l)) return 4;
         if (IsScalar(t)) return 4;
         if (auto w = VecWidth(t)) return PackedSize(VecElem(t), l) * w;
         if (auto a = FixedArray(t)) return PackedSize(a->sub, l) * a->size;
@@ -485,6 +505,11 @@ struct GpuEmitter {
     // §5): a function per type.
     unordered_map<string, string> readers;
     string ReadX(const string &index, const string &i, TypeExpr *t, Line l) {
+        return ReadAt(index, cat("(", i, ") * ", PackedSize(t, l), "u"), t, l);
+    }
+
+    // A value of type t at byte `at` of the buffer at heap index `index`.
+    string ReadAt(const string &index, const string &at, TypeExpr *t, Line l) {
         auto tn = TypeName(t, l);
         if (!helpers.count("gs_word")) {
             helpers.insert("gs_word");
@@ -509,12 +534,15 @@ struct GpuEmitter {
             body += "    return r;\n}\n\n";
             helperdefs += body;
         }
-        auto stride = PackedSize(t, l);
-        return cat(it->second, "(", msl() ? "gs, " : "", index, ", (", i, ") * ", stride, "u)");
+        return cat(it->second, "(", msl() ? "gs, " : "", index, ", ", at, ")");
     }
 
     void ReadFields(TypeExpr *t, const string &path, const string &at, int64_t off, string &body, Line l) {
         auto word = [&](int64_t o) { return cat("gs_word(b, ", at, " + ", o, "u)"); };
+        if (RelRef(t, l)) {
+            body += cat("    ", path, " = ", t->ref->pool ? word(off) : cat("int(", word(off), ")"), ";\n");
+            return;
+        }
         if (IsScalar(t)) {
             body += cat("    ", path, " = ", FromWord(word(off), t, l), ";\n");
             return;
@@ -706,6 +734,157 @@ struct GpuEmitter {
         auto et = GpuArray(t)->sub;
         auto x = cat(arr, ".v[", i, "]");
         return msl() && VecWidth(et) ? cat(TypeName(et, l), "(", x, ")") : x;
+    }
+
+    // A global array a GPU function reads (design/gpu_language.md §10): the
+    // buffer the gpu package uploaded it into, found in the table at heap
+    // index 1 by the global's number, its heap index and length.
+    VarDef *GlobalArray(Node *n) {
+        auto id = Is<Ident>(n);
+        if (!id || !id->vdef || !id->vdef->isglobal || !id->vdef->isvar) return nullptr;
+        auto t = id->vdef->type;
+        if (t->kind != TY_ARRAY || t->arr->akind == A_FIXED) return nullptr;
+        if (t->arr->akind != A_GROW)
+            Fail(n, cat("a global array a GPU function reads is grow-only (T[>..]), not ", TypeStr(t)));
+        return id->vdef;
+    }
+
+    string GlobalRef(VarDef *v, Line l) {
+        if (helpers.insert("gs_global").second)
+            helperdefs += hlsl() ? "uint2 gs_global(uint id) {\n    ByteAddressBuffer t = ResourceDescriptorHeap[1];\n"
+                                   "    return t.Load2(id * 8u);\n}\n\n"
+                                 : "uint2 gs_global(thread GsCtx &gs, uint id) {\n"
+                                   "    return reinterpret_cast<device const uint2 *>(gs.heap[1])[id];\n}\n\n";
+        auto id = ast.GpuGlobalId(v);
+        if (id < 0) Fail(l, "internal: no number for a global");
+        auto t = Temp();
+        L(cat("const uint2 ", t, " = gs_global(", Gs(), id, "u);"));
+        return t;
+    }
+
+    // Element `i` of the buffer at heap index `index`, of type `et`.
+    string LoadElem(const string &index, const string &i, TypeExpr *et, Line l) {
+        if (HasAdt(et)) return ReadX(index, i, et, l);
+        auto [e, off] = BufferElem(index, i, et, l, false);
+        if (msl()) return VecWidth(et) ? cat(TypeName(et, l), "(", e, ")") : e;
+        return cat(e, ".Load<", TypeName(et, l), ">(", off, ")");
+    }
+
+    // ------------------------------------------------------------------
+    // References into global arrays (design/gpu_language.md §9): the byte
+    // offset of what they name in the array's buffer, plus one, zero for
+    // null, as Goose stores an `in pool` link. A self-relative link loads as
+    // its field's own offset plus what it stores.
+
+    // A field's packed offset in its struct.
+    int64_t FieldOffset(TypeExpr *t, int idx, Line l) {
+        auto si = Inst(t, l);
+        int64_t off = 0;
+        for (int i = 0; i < idx; i++) {
+            auto &f = si->st->fields[i];
+            if (f.ispad) off += f.padsize >= 0 ? f.padsize : (4 - off % 4) % 4;
+            else off += PackedSize(si->ftypes[i], f.line);
+        }
+        return off;
+    }
+
+    // The global array n's storage lies in, and its byte offset there.
+    bool PlaceOf(Node *n, VarDef *&g, string &off) {
+        if (auto u = Is<Unary>(n); u && u->op == T_BITAND) return PlaceOf(u->child, g, off);
+        if (auto ix = Is<Index>(n)) {
+            if (auto ga = GlobalArray(ix->obj)) {
+                auto ref = GlobalRef(ga, n->line);
+                auto i = ix->nobc ? IndexX(ix->idx) : CheckedIndexLen(ix->idx, cat(ref, ".y"), n->line);
+                g = ga;
+                off = cat("(uint(", i, ") * ", PackedSize(ga->type->arr->sub, n->line), "u)");
+                return true;
+            }
+            return false;
+        }
+        if (auto d = Is<Dot>(n); d && d->IsField()) {
+            auto ot = d->obj->exprtype;
+            if (ot->kind == TY_REF) ot = ot->ref->sub;
+            if (ot->kind != TY_STRUCT || VecWidth(ot)) return false;
+            string base;
+            if (!PlaceOf(d->obj, g, base)) return false;
+            off = cat("(", base, " + ", FieldOffset(ot, d->fieldidx, n->line), "u)");
+            return true;
+        }
+        string v;
+        if (!RefValue(n, g, v)) return false;
+        off = cat("(", v, " - 1u)");
+        return true;
+    }
+
+    // A reference into a global array, as its offset plus one.
+    bool RefValue(Node *n, VarDef *&g, string &v) {
+        if (auto u = Is<Unary>(n); u && u->op == T_BITAND) {
+            string off;
+            if (!PlaceOf(u->child, g, off)) return false;
+            v = cat("(", off, " + 1u)");
+            return true;
+        }
+        if (auto id = Is<Ident>(n)) {
+            auto it = fs->places.find(id->vdef);
+            if (it == fs->places.end()) return false;
+            g = it->second;
+            v = fs->locals[id->vdef];
+            return true;
+        }
+        if (Is<Index>(n) && GlobalArray(Is<Index>(n)->obj) && n->exprtype && n->exprtype->kind != TY_REF) {
+            // An element bound by reference.
+            string off;
+            if (!PlaceOf(n, g, off)) return false;
+            v = cat("(", off, " + 1u)");
+            return true;
+        }
+        if (auto d = Is<Dot>(n); d && d->IsField()) {
+            auto ot = d->obj->exprtype;
+            if (ot->kind == TY_REF) ot = ot->ref->sub;
+            if (ot->kind != TY_STRUCT || VecWidth(ot)) return false;
+            auto si = Inst(ot, n->line);
+            auto ft = si->ftypes[d->fieldidx];
+            if (!RelRef(ft, n->line)) {
+                // A field that is an element of a global array bound by
+                // reference.
+                if (n->exprtype && n->exprtype->kind == TY_REF) return false;
+                string off;
+                if (!PlaceOf(n, g, off)) return false;
+                v = cat("(", off, " + 1u)");
+                return true;
+            }
+            string fo;
+            if (!PlaceOf(n, g, fo)) return false;
+            auto word = ReadAt(cat(GlobalRef(g, n->line), ".x"), fo, ft, n->line);
+            auto t = Temp();
+            if (ft->ref->pool) {
+                g = ft->ref->pool;
+                L(cat("const uint ", t, " = ", word, ";"));
+            } else {
+                // Self-relative: from the field, within its own array.
+                auto w = Temp();
+                L(cat("const int ", w, " = ", word, ";"));
+                L(cat("const uint ", t, " = ", w, " == 0 ? 0u : uint(int(", fo, ") + ", w, ") + 1u;"));
+            }
+            v = t;
+            return true;
+        }
+        // A value of an `in pool` reference type: a link already.
+        auto t = n->exprtype;
+        if (t && t->kind == TY_REF && t->ref->pool && t->ref->lenstorage == IS_U32) {
+            g = t->ref->pool;
+            v = X(n);
+            return true;
+        }
+        if (auto c = Is<Call>(n); c && c->builtin == B_POP) {
+            auto la = LimitedArray(ArrayType(c->ArgNodes()[0]));
+            if (la && la->sub->kind == TY_REF && la->sub->ref->pool) {
+                g = la->sub->ref->pool;
+                v = X(n);
+                return true;
+            }
+        }
+        return false;
     }
 
     // An index, in the type the dialect indexes with: a literal as it is.
@@ -1045,6 +1224,11 @@ struct GpuEmitter {
             }
             case NK_Index: {
                 auto ix = (Index *)n;
+                if (auto g = GlobalArray(ix->obj)) {
+                    auto ref = GlobalRef(g, n->line);
+                    auto i = ix->nobc ? IndexX(ix->idx) : CheckedIndexLen(ix->idx, cat(ref, ".y"), n->line);
+                    return LoadElem(cat(ref, ".x"), i, g->type->arr->sub, n->line);
+                }
                 auto at = ArrayType(ix->obj);
                 if (!GpuArray(at)) TypeName(at, n->line);   // Fails, saying why.
                 auto o = X(ix->obj);
@@ -1477,6 +1661,19 @@ struct GpuEmitter {
     }
 
     string DotX(Dot *d) {
+        if (d->IsField()) {
+            auto ot = d->obj->exprtype;
+            if (ot->kind == TY_REF) ot = ot->ref->sub;
+            VarDef *g = nullptr;
+            string off;
+            if (ot->kind == TY_STRUCT && !VecWidth(ot) && !Is<Index>(d->obj) && PlaceOf(d->obj, g, off)) {
+                auto ft = Inst(ot, d->line)->ftypes[d->fieldidx];
+                string v;
+                if (RelRef(ft, d->line) && RefValue(d, g, v)) return v;
+                return ReadAt(cat(GlobalRef(g, d->line), ".x"),
+                              cat("(", off, " + ", FieldOffset(ot, d->fieldidx, d->line), "u)"), ft, d->line);
+            }
+        }
         if (d->variantconst) {
             // A variant without a payload: its tag alone.
             auto ei = d->einst;
@@ -1492,6 +1689,7 @@ struct GpuEmitter {
             return PackVariant(t, vi, "", d->line);
         }
         if (d->member == B_LEN) {
+            if (auto g = GlobalArray(d->obj)) return cat("int(", GlobalRef(g, d->line), ".y)");
             if (auto a = FixedArray(ArrayType(d->obj))) return LenText(a->size, d->exprtype, d->line);
             if (LimitedArray(ArrayType(d->obj))) return cat("int(", X(d->obj), ".len)");
         }
@@ -1519,6 +1717,8 @@ struct GpuEmitter {
             return cat(LValue(d->obj), ".", VecWidth(ot) ? string(d->name) : FieldName(d->name));
         }
         if (auto ix = Is<Index>(n)) {
+            if (GlobalArray(ix->obj))
+                Fail(n, "a global array is read-only on the GPU (design/gpu_language.md §10)");
             auto at = ArrayType(ix->obj);
             auto lv = LValue(ix->obj);
             auto i = ix->nobc ? IndexX(ix->idx)
@@ -1682,10 +1882,7 @@ struct GpuEmitter {
                     auto et = c->rettypes[0];
                     auto index = X(an[0]);
                     auto i = X(an[1]);
-                    if (HasAdt(et)) return ReadX(index, i, et, c->line);
-                    auto [e, off] = BufferElem(index, i, et, c->line, false);
-                    if (msl()) return VecWidth(et) ? cat(TypeName(et, c->line), "(", e, ")") : e;
-                    return cat(e, ".Load<", TypeName(et, c->line), ">(", off, ")");
+                    return LoadElem(index, i, et, c->line);
                 }
                 case B_GPU_STORE: {
                     auto et = an[2]->exprtype;
@@ -1705,6 +1902,10 @@ struct GpuEmitter {
                 case B_GPU_SAMPLE: case B_GPU_SAMPLE_LEVEL: case B_GPU_TEXEL:
                 case B_GPU_STORE_TEXEL:
                     return TextureX(c, an);
+                case B_GPU_GLOBAL_ID: {
+                    auto id = Is<Ident>(an[0]);
+                    return cat(ast.GpuGlobalId(id ? id->vdef : nullptr), "u");
+                }
                 case B_GPU_ATOMIC: case B_GPU_ATOMIC_CAS: {
                     auto cas = c->builtin == B_GPU_ATOMIC_CAS;
                     auto target = an[cas ? 0 : 1];
@@ -1723,6 +1924,7 @@ struct GpuEmitter {
                 case B_PUSH: case B_POP: case B_POP_N: case B_CLEAR: return LimitedOpX(c, an);
                 case B_DEFAULT: return ZeroOf(c->exprtype, c->line);
                 case B_LEN:
+                    if (auto g = GlobalArray(an[0])) return cat("int(", GlobalRef(g, c->line), ".y)");
                     if (auto a = FixedArray(ArrayType(an[0])))
                         return LenText(a->size, c->exprtype, c->line);
                     if (LimitedArray(ArrayType(an[0]))) return cat("int(", X(an[0]), ".len)");
@@ -1758,8 +1960,22 @@ struct GpuEmitter {
                                   "an alias could tell apart"));
             roots.push_back({ root, writes });
         }
+        vector<VarDef *> placeargs(an.size(), nullptr);
         for (size_t i = 0; i < an.size(); i++) {
             auto pt = i < sp->argtypes.size() ? sp->argtypes[i] : nullptr;
+            if (pt && pt->kind == TY_REF) {
+                VarDef *g = nullptr;
+                string rv;
+                if (RefValue(an[i], g, rv)) {
+                    // An element of a global array: its place, which the callee
+                    // reads through.
+                    if (WritableRef(pt))
+                        Fail(an[i], "a global array is read-only on the GPU (design/gpu_language.md §10)");
+                    placeargs[i] = g;
+                    args.push_back(rv);
+                    continue;
+                }
+            }
             if (!pt || !WritableRef(pt)) {
                 auto at = an[i];
                 if (auto u = Is<Unary>(at); u && u->op == T_BITAND) at = u->child;
@@ -1786,7 +2002,7 @@ struct GpuEmitter {
             writebacks.push_back({ lv, t });
             args.push_back(t);
         }
-        auto name = EnsureFn(sp, c->line);
+        auto name = EnsureFn(sp, c->line, placeargs);
         string r = cat(name, "(");
         for (size_t i = 0; i < args.size(); i++) r += cat(i ? ", " : "", args[i]);
         r += ")";
@@ -2029,7 +2245,15 @@ struct GpuEmitter {
         FaultHelper();
         switch (c->builtin) {
             case B_PUSH: {
-                auto v = Convert(X(an[1]), an[1]->exprtype, la->sub, c->line);
+                string v;
+                VarDef *g = nullptr;
+                if (la->sub->kind == TY_REF) {
+                    if (!RefValue(an[1], g, v) || g != la->sub->ref->pool)
+                        Fail(an[1], "a link pushed on the GPU names an element of the global array its "
+                                    "type names");
+                } else {
+                    v = Convert(X(an[1]), an[1]->exprtype, la->sub, c->line);
+                }
                 L(cat("if (", lv, ".len < ", la->size, "u) {"));
                 L(cat("    ", lv, ".v[", lv, ".len] = ", v, ";"));
                 L(cat("    ", lv, ".len++;"));
@@ -2197,6 +2421,16 @@ struct GpuEmitter {
                     return;
                 }
                 auto v = vd->defs[0];
+                if (v->type->kind == TY_REF && !vd->inits.empty()) {
+                    VarDef *g = nullptr;
+                    string rv;
+                    if (RefValue(vd->inits[0], g, rv)) {
+                        auto name = LocalName(v);
+                        L(cat(vd->isvar ? "uint " : "const uint ", name, " = ", rv, ";"));
+                        fs->places[v] = g;
+                        return;
+                    }
+                }
                 if (v->type->kind == TY_REF) {
                     // A reference local names the storage it is bound to.
                     if (IsOptional(v->type))
@@ -2225,9 +2459,23 @@ struct GpuEmitter {
             }
             case NK_Assign: {
                 auto a = (Assign *)n;
-                if (a->op == T_DOTASSIGN)
-                    Fail(n, "rebinding a reference does not run on the GPU yet "
-                            "(design/gpu_language.md §8)");
+                if (a->op == T_DOTASSIGN) {
+                    VarDef *g = nullptr;
+                    string rv;
+                    auto id = Is<Ident>(a->lval);
+                    if (id && fs->places.count(id->vdef)) {
+                        if (Is<NullLit>(a->rhs)) {
+                            L(cat(fs->locals[id->vdef], " = 0u;"));
+                            return;
+                        }
+                        if (RefValue(a->rhs, g, rv)) {
+                            L(cat(fs->locals[id->vdef], " = ", rv, ";"));
+                            return;
+                        }
+                    }
+                    Fail(n, "rebinding a reference does not run on the GPU yet, except one into a global "
+                            "array (design/gpu_language.md §8)");
+                }
                 if (a->pointee && !IsAlias(a->lval)) Fail(n, "references do not run on the GPU");
                 auto lv = LValue(a->lval);
                 if (a->op == T_SHLEQ || a->op == T_SHREQ) {
@@ -2434,6 +2682,31 @@ struct GpuEmitter {
     // `for x in a`, `for x, i in a` and `for &x in a` over a fixed array: a
     // counted loop, the element a copy, or for `&x` the element itself.
     void ForArray(ForLoop *f) {
+        if (auto g = GlobalArray(f->iter)) {
+            auto ref = GlobalRef(g, f->line);
+            auto ctr = Temp();
+            fs->breakdsts.push_back("");
+            L(cat("for (uint ", ctr, " = 0u; ", ctr, " < ", ref, ".y; ", ctr, "++) {"));
+            fs->ind++;
+            if (f->idxdef) {
+                auto it = TypeName(f->idxdef->type, f->line);
+                L(cat("const ", it, " ", LocalName(f->idxdef), " = (", it, ")", ctr, ";"));
+            }
+            if (f->byref) {
+                // The element itself: its place, which writes through refuse.
+                L(cat("const uint ", LocalName(f->vdef), " = ", ctr, " * ", PackedSize(g->type->arr->sub, f->line),
+                      "u + 1u;"));
+                fs->places[f->vdef] = g;
+            } else {
+                L(cat("const ", TypeName(f->vdef->type, f->line), " ", LocalName(f->vdef), " = ",
+                      LoadElem(cat(ref, ".x"), ctr, g->type->arr->sub, f->line), ";"));
+            }
+            Stmt(f->body);
+            fs->ind--;
+            L("}");
+            fs->breakdsts.pop_back();
+            return;
+        }
         auto at = ArrayType(f->iter);
         auto fa = GpuArray(at);
         if (!fa) TypeName(at, f->line);   // Fails, saying why.
@@ -2476,8 +2749,10 @@ struct GpuEmitter {
     // ------------------------------------------------------------------
     // Functions.
 
-    string EnsureFn(FnSpec *sp, Line callsite) {
-        if (auto it = fnnames.find(sp); it != fnnames.end()) return it->second;
+    string EnsureFn(FnSpec *sp, Line callsite, const vector<VarDef *> &placeargs = {}) {
+        vector<VarDef *> key = placeargs;
+        key.resize(sp->params.size(), nullptr);
+        if (auto it = fnnames.find({ sp, key }); it != fnnames.end()) return it->second;
         if (inprogress.count(sp))
             Fail(callsite, cat("recursion does not run on the GPU: ", sp->sf->name,
                                " calls itself"));
@@ -2499,6 +2774,11 @@ struct GpuEmitter {
             auto v = sp->params[i];
             if (!params.empty()) params += ", ";
             auto t = v->type;
+            if (key[i]) {
+                params += cat("uint ", LocalName(v));
+                fs->places[v] = key[i];
+                continue;
+            }
             if (t->kind == TY_REF) {
                 if (IsOptional(t))
                     Fail(v->line, cat("optional references do not run on the GPU yet "
@@ -2526,7 +2806,7 @@ struct GpuEmitter {
         chain.pop_back();
         callsites.pop_back();
         inprogress.erase(sp);
-        fnnames[sp] = name;
+        fnnames[{ sp, key }] = name;
         fndefs += cat(ret, " ", name, "(", params, ") {\n", st.out, "}\n\n");
         return name;
     }
@@ -2590,7 +2870,7 @@ struct GpuEmitter {
     // constant buffer is checked against and read from (§5.3).
     struct Leaf { string path; TypeExpr *type; int64_t off; };
     void Leaves(TypeExpr *t, const string &path, int64_t off, vector<Leaf> &out, Line l) {
-        if (IsScalar(t)) {
+        if (IsScalar(t) || RelRef(t, l)) {
             out.push_back({ path, t, off });
             return;
         }

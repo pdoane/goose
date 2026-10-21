@@ -65,7 +65,13 @@ atomics and wave operations; references as parameters and locals (§3),
 multiple returns and `return … from` (§4); fixed-mode ADTs, `match` and
 case functions, with ADTs read from buffers in Goose's packed layout (§5);
 faults (§6), with `packages/gpu/test/faults.goose` triggering each kind;
-and limited arrays (§7), read from buffers as Goose packs them.
+limited arrays (§7), read from buffers as Goose packs them; global arrays
+uploaded as buffers (§10) and references into them, self-relative and `in
+pool` (§9). `packages/gpu/examples/gltf/bvh.goose` builds a BVH over a
+glTF model on the CPU, linked by self-relative references, uploads it byte
+for byte, and traces it with one function on the CPU and the GPU: every
+sampled pixel agrees with the CPU, and all but one of 691,200 with Metal's
+hardware traversal; it runs on Vulkan, which has no ray queries here.
 `packages/gpu/test/language.goose` runs one function over all of them on
 the GPU and the CPU and compares the results, and the glTF path tracer's
 materials are an ADT (`Bsdf`, opaque or glass with volume absorption)
@@ -229,12 +235,28 @@ tree, built on the CPU with `Node&<u16>` links (A.2), is traversed on the
 GPU without a serializer, a conversion pass or a second definition of the
 node.
 
-The lowering: a reference into a buffer is the buffer's heap index and a
-byte offset; a self-relative load adds the stored offset to the field's;
-`in pool` links (§3.9) add theirs to the pool's base, the pool being a
-global bound as §10 binds one. Verification is the CPU's: `from_bytes`
-has checked an image that arrives from outside the program (§9.4), and an
-image the program built was proven by construction.
+The lowering, as built: a reference whose root is a global array (§10) is
+the byte offset of what it names in that array's buffer, plus one, zero for
+null, which is exactly how Goose stores an `in pool` link, so such a link
+needs no conversion; `&nodes[i]` is `i` times the element size plus one; a
+self-relative link loads as its field's own offset plus what it stores;
+reading through a reference reads words at its offset, put together
+across any misalignment. A reference local, or a parameter a call passes
+one to (the callee emitted once per combination of such parameters), holds
+the offset; an optional one's null test is the offset's. Only 32-bit links
+run on the GPU. Writes through these references are rejected, as writes to
+global arrays are (§10). Verification is the CPU's: `from_bytes` has
+checked an image that arrives from outside the program (§9.4), and an image
+the program built was proven by construction.
+
+What a structure may hold to be uploaded is what `bytes_of` writes out:
+self-relative links, which are the point of the form, and not `in pool`
+ones, which the language counts as measured from a global rather than from
+the image. For a GPU copy they would be sound, since the copy's buffer
+starts where the pool does, but allowing it is a change to the language's
+image rule, not to this design; meanwhile a traversal keeps `in pool` links
+on its stack (`(const Node&<u32 in nodes>)[..64]`), whose type names the
+array, and the tree's own links are self-relative.
 
 The showcase is a BVH: built in Goose on the CPU over a glTF scene,
 linked with relative references, uploaded as bytes, and traversed by one
@@ -245,15 +267,29 @@ Metal.
 
 ## 10. Global arrays and index types as buffers
 
-An index type `u32 in nodes` is below `nodes.len` wherever it can be
-named (§3.11), and its motivating example is a mesh's index buffer. If a
-global array is a GPU buffer, the proof carries over: the program binds the
-global's current contents (`gpu::upload(nodes)` makes or updates the
-buffer; a shader reads `nodes[i]` as the global), and a shader indexing
-`nodes` with a `u32 in nodes` read from another uploaded array needs no
-check, since the arrays it came from were checked when they were built and
-uploaded together. The upload records each global's length, which is what
-a check against an ordinary index compares with.
+As built: a GPU function reads a grow-only global array as if it were the
+global (`nodes[i]`, `nodes.len`, `for n in nodes`, `for &n in nodes`), and
+the host uploads its current contents with `gpu::upload(gpu_global_id(nodes),
+nodes)`. `gpu_global_id` is a builtin giving the global's number in the
+program, which the package's table of uploaded globals, at heap index 1, is
+indexed by: each entry the buffer's heap index and the length uploaded. An
+upload is copied before the next submission runs, as an update is, and an
+index is checked against the uploaded length. A GPU function writes no
+global array. The id is passed explicitly because a generic function sees
+its argument as a parameter, not as the global; resolving it through the
+parameter's root, which the checker knows at each call, would let
+`gpu::upload(nodes)` stand alone.
+
+An index type `u32 in nodes` is below `nodes.len` wherever it can be named
+(§3.11), and its motivating example is a mesh's index buffer, so a shader
+indexing an uploaded `nodes` with one should need no check. That holds
+only if the GPU's copy is at least as long as the array the index was
+proven against, and an upload is a snapshot: an index taken after `nodes`
+grew and passed to a shader holding the older copy is out of its range. So
+indices of index types are still checked; eliding the check needs uploads
+to say which globals' lengths an uploaded array's indices depend on, and
+to refuse one whose dependencies' copies are shorter than their arrays,
+which the compiler can tell from the element type.
 
 What this removes from GPU programs is the class of bug where an index
 buffer and a vertex buffer disagree, found today as garbage on the screen

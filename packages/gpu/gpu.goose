@@ -147,6 +147,7 @@ extern "goose_gpu_storage_view" fn storage_view_native(index: u32, mip: i64) -> 
 extern "goose_gpu_texture_info" fn texture_info_into(index: u32, out: TextureDesc&) -> bool;
 extern "goose_gpu_load_texture" fn load_texture_native(path: const u8[:], flags: i64) -> u32;
 extern "goose_gpu_image_texture" fn image_texture_native(data: const u8[:], flags: i64) -> u32;
+extern "goose_gpu_upload" fn upload_native(id: u32, data: const u8[:], count: i64) -> bool;
 extern "goose_gpu_generate_mips" fn generate_mips_native(index: u32);
 extern "goose_gpu_save_png" fn save_png_native(index: u32, path: const u8[:]) -> bool;
 extern "goose_gpu_compute_pipeline" fn compute_pipeline_native(library: const u8[:]) -> u32;
@@ -318,6 +319,13 @@ fn update_buffer(b: Buffer, offset: i64, data: const u8[:]) -> bool {
     update_buffer_native(b.index, offset, data)
 }
 fn update_texture(t: Texture, data: const u8[:]) -> bool { update_texture_native(t.index, data) }
+
+// A global array's contents, for GPU functions to read as the global
+// (docs/design/gpu_language.md §10): `gpu::upload(gpu_global_id(nodes),
+// nodes)`. Copied before the next submission runs, as an update is; a GPU
+// function reads what the last upload gave it, checked against that
+// length, and writes none of it.
+fn upload<T>(id: u32, g: const T[>..]&) -> bool { upload_native(id, bytes_of(g), g.len) }
 
 // The handles a shader takes, from the host's.
 fn structured<T>(b: Buffer) -> StructuredBuffer<T> { StructuredBuffer<T> { b.index } }
