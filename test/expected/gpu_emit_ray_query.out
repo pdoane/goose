@@ -184,6 +184,8 @@ struct GsCtx {
     uint instance_index;
     float4 frag_coord;
     bool front_facing;
+    uint simd_lane;
+    uint simd_size;
 };
 
 gpu_Hit gs_trace(thread GsCtx &gs, uint accel, gpu_Ray r, uint mask) {

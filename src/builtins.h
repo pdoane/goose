@@ -90,6 +90,8 @@ inline int RecvKindOf(TypeExpr *t) {
     F(B_GPU_SAMPLE_LEVEL, "gpu_sample_level", 4,  4,   "",   "",  0,              BF_TYARGS | BF_CUSTOM) \
     F(B_GPU_TEXEL,        "gpu_texel",        3,  3,   "",   "",  0,              BF_TYARGS | BF_CUSTOM) \
     F(B_GPU_STORE_TEXEL,  "gpu_store_texel",  3,  3,   "",   "",  0,              BF_CUSTOM) \
+    F(B_GPU_ATOMIC,       "gpu_atomic",       3,  3,   "",   "",  0,              BF_CUSTOM) \
+    F(B_GPU_ATOMIC_CAS,   "gpu_atomic_cas",   3,  3,   "",   "",  0,              BF_CUSTOM) \
     F(B_LEN,              "len",              1,  1,   "",   "i", BR_ANY,         BF_MEMBER | BF_PROPERTY) \
     F(B_CAP,              "cap",              1,  1,   "",   "i", BR_LIMITED,     BF_MEMBER | BF_PROPERTY) \
     F(B_INDEX_OF,         "index_of",         2,  2,   "",   "i", BR_INDEXABLE,   BF_MEMBER | BF_CUSTOM) \

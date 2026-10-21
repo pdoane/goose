@@ -124,6 +124,12 @@ struct GpuEmitter {
 
     static TypeExpr *VecElem(const TypeExpr *t) { return t->struc->args[0]; }
 
+    // gpu::GroupShared<T> (stdlib/gpu_shader.goose): a global `var` of it
+    // is a compute group's shared memory.
+    static bool IsGroupShared(const TypeExpr *t) {
+        return t->kind == TY_STRUCT && t->struc->st && t->struc->st->qname == "gpu::GroupShared";
+    }
+
     // A fixed array T[k], the only array kind on the GPU: its detail, else
     // null.
     static TypeArray *FixedArray(const TypeExpr *t) {
@@ -455,6 +461,7 @@ struct GpuEmitter {
         auto v = id->vdef;
         if (!v) Fail(id, cat("function values do not run on the GPU yet: ", id->name));
         if (v->isglobal) {
+            if (v->isvar && IsGroupShared(v->type)) return SharedRef(v, id->line);
             // A named constant reads as its value (§5.2): no other global
             // exists on the GPU.
             if (v->constlit) {
@@ -515,6 +522,99 @@ struct GpuEmitter {
             return true;
         }
         return false;
+    }
+
+    // Group memory (gpu::GroupShared): HLSL's groupshared globals, MSL's
+    // threadgroup variables, which a kernel declares and the context
+    // points every function at.
+    vector<pair<string, string>> shared;    // Each one's name and type.
+    unordered_map<VarDef *, string> sharednames;
+    int64_t sharedbytes = 0;
+    string SharedRef(VarDef *v, Line l) {
+        if (entry->sf->gpustage != GPU_COMPUTE)
+            Fail(l, cat("group memory exists in a compute entry point only, and ", v->name,
+                        " is reached from ", GpuStageName(entry->sf->gpustage), " fn ",
+                        entry->sf->name));
+        auto it = sharednames.find(v);
+        if (it == sharednames.end()) {
+            auto tn = TypeName(v->type, l);
+            sharedbytes += PackedSize(v->type, l);
+            if (sharedbytes > 32768)
+                Fail(l, cat("group memory is at most 32 KiB, and ", v->name, " brings it to ",
+                            sharedbytes, " bytes"));
+            auto name = FreshGlobal(string(v->name));
+            shared.push_back({ name, tn });
+            it = sharednames.emplace(v, name).first;
+        }
+        return msl() ? cat("(*gs.", it->second, ")") : it->second;
+    }
+
+    // Whether an lvalue lies in group memory: its root a GroupShared global.
+    static bool InShared(Node *n) {
+        for (;;) {
+            if (auto d = Is<Dot>(n); d && d->IsField()) n = d->obj;
+            else if (auto ix = Is<Index>(n)) n = ix->obj;
+            else break;
+        }
+        auto id = Is<Ident>(n);
+        return id && id->vdef && id->vdef->isglobal && id->vdef->isvar && IsGroupShared(id->vdef->type);
+    }
+
+    // A constant integer argument: a literal or a named constant.
+    int64_t ConstInt(Node *n, const char *what) {
+        if (auto i = Is<IntLit>(n)) return i->val;
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->constlit) return id->vdef->constval;
+        Fail(n, cat(what, " is a constant"));
+    }
+
+    // An atomic change to `lv` (the dialect's lvalue of a u32 or i32) or,
+    // with `buffer`, to element `i` of the buffer at heap index `buffer`:
+    // the old value. `cmp` non-empty: a compare-exchange.
+    string AtomicX(int op, const string &lv, const string &buffer, const string &i,
+                   const string &v, const string &cmp, TypeExpr *t, Line l) {
+        static const char *hl[] = { "InterlockedAdd", "InterlockedMin", "InterlockedMax",
+                                    "InterlockedAnd", "InterlockedOr", "InterlockedXor",
+                                    "InterlockedExchange" };
+        static const char *ms[] = { "atomic_fetch_add_explicit", "atomic_fetch_min_explicit",
+                                    "atomic_fetch_max_explicit", "atomic_fetch_and_explicit",
+                                    "atomic_fetch_or_explicit", "atomic_fetch_xor_explicit",
+                                    "atomic_exchange_explicit" };
+        if (op < 0 || op > 6) Fail(l, "an atomic's op is one of gpu::ATOMIC_ADD .. ATOMIC_EXCHANGE");
+        auto tn = ScalarName(t, l);
+        auto old = Temp();
+        if (hlsl()) {
+            L(cat(tn, " ", old, ";"));
+            string target = lv;
+            string prefix;
+            if (!buffer.empty()) {
+                auto b = Temp();
+                L(cat("RWByteAddressBuffer ", b, " = ResourceDescriptorHeap[", buffer, "];"));
+                prefix = cat(b, ".");
+                target = cat("(", i, ") * 4u");
+            }
+            if (!cmp.empty())
+                L(cat(prefix, "InterlockedCompareExchange(", target, ", ", cmp, ", ", v, ", ", old, ");"));
+            else
+                L(cat(prefix, hl[op], "(", target, ", ", v, ", ", old, ");"));
+            return old;
+        }
+        auto at = tn == "int" ? "atomic_int" : "atomic_uint";
+        auto ptr = buffer.empty()
+                       ? cat("reinterpret_cast<threadgroup ", at, " *>(&(", lv, "))")
+                       : cat("(reinterpret_cast<device ", at, " *>(gs.heap[", buffer, "]) + (", i, "))");
+        if (cmp.empty()) {
+            L(cat(tn, " ", old, " = ", ms[op], "(", ptr, ", ", v, ", memory_order_relaxed);"));
+            return old;
+        }
+        // Metal's compare-exchange is weak: retried while it failed with the
+        // value it wanted, which a strong one would have taken.
+        L(cat(tn, " ", old, ";"));
+        L("for (;;) {");
+        L(cat("    ", old, " = ", cmp, ";"));
+        L(cat("    if (atomic_compare_exchange_weak_explicit(", ptr, ", &", old, ", ", v,
+              ", memory_order_relaxed, memory_order_relaxed) || ", old, " != (", cmp, ")) break;"));
+        L("}");
+        return old;
     }
 
     // The global tables (IdentX), declared after the structs.
@@ -828,6 +928,21 @@ struct GpuEmitter {
                 case B_GPU_SAMPLE: case B_GPU_SAMPLE_LEVEL: case B_GPU_TEXEL:
                 case B_GPU_STORE_TEXEL:
                     return TextureX(c, an);
+                case B_GPU_ATOMIC: case B_GPU_ATOMIC_CAS: {
+                    auto cas = c->builtin == B_GPU_ATOMIC_CAS;
+                    auto target = an[cas ? 0 : 1];
+                    if (!InShared(target))
+                        Fail(target, cat(BuiltinByKind(c->builtin).name, " changes a value in group "
+                                         "memory (gpu::GroupShared); a buffer's atomics are "
+                                         "gpu::atomic_add and the rest"));
+                    RequireStage(c, GPU_COMPUTE, BuiltinByKind(c->builtin).name);
+                    auto op = cas ? 0 : (int)ConstInt(an[0], "an atomic's op");
+                    auto lv = LValue(target);
+                    auto t = c->rettypes[0];
+                    auto v = X(an[2]);
+                    auto cmp = cas ? X(an[1]) : string();
+                    return AtomicX(op, lv, "", "", v, cmp, t, c->line);
+                }
                 case B_DEFAULT: return ZeroOf(c->exprtype, c->line);
                 case B_LEN:
                     if (auto a = FixedArray(ArrayType(an[0])))
@@ -876,6 +991,25 @@ struct GpuEmitter {
                 { "front_facing", GPU_FRAGMENT, "front_facing" },
             };
             if (what == "trace" || what == "trace_any") return TraceX(c, sp, an, what == "trace");
+            if (what.starts_with("atomic_")) {
+                static const char *ops[] = { "add", "min", "max", "and", "or", "xor", "exchange" };
+                auto opname = what.substr(7);
+                auto u32 = ast.inttypes[IS_U32];
+                if (opname == "cas")
+                    return AtomicX(0, "", X(an[0]), X(an[1]), X(an[3]), X(an[2]), u32, c->line);
+                for (int k = 0; k < 7; k++)
+                    if (opname == ops[k]) return AtomicX(k, "", X(an[0]), X(an[1]), X(an[2]), "", u32, c->line);
+                Fail(c, cat("internal: unknown atomic ", cn));
+            }
+            if (what == "group_barrier" || what == "device_barrier") {
+                RequireStage(c, GPU_COMPUTE, cat(what, "()"));
+                auto device = what == "device_barrier";
+                L(hlsl() ? (device ? "AllMemoryBarrierWithGroupSync();" : "GroupMemoryBarrierWithGroupSync();")
+                         : (device ? "threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);"
+                                   : "threadgroup_barrier(mem_flags::mem_threadgroup);"));
+                return "";
+            }
+            if (what.starts_with("wave_")) return WaveX(c, string(what.substr(5)), an);
             if (what == "discard") {
                 RequireStage(c, GPU_FRAGMENT, "discard()");
                 L(hlsl() ? "discard;" : "discard_fragment();");
@@ -911,6 +1045,44 @@ struct GpuEmitter {
             }
         }
         Fail(c, cat("extern fn ", sp->sf->name, " runs on the CPU only"));
+    }
+
+    // A wave intrinsic (stdlib/gpu_shader.goose), compute and fragment
+    // entries.
+    bool simd = false;
+    string WaveX(Call *c, const string &op, const vector<Node *> &an) {
+        auto stage = entry->sf->gpustage;
+        if (stage != GPU_COMPUTE && stage != GPU_FRAGMENT)
+            Fail(c, cat("wave_", op, "() exists in compute and fragment entry points, and this is "
+                        "reached from ", GpuStageName(stage), " fn ", entry->sf->name));
+        simd = true;
+        if (op == "lane") return hlsl() ? "WaveGetLaneIndex()" : "gs.simd_lane";
+        if (op == "size") return hlsl() ? "WaveGetLaneCount()" : "gs.simd_size";
+        struct W { const char *op, *h, *m; };
+        static const W ws[] = {
+            { "sum", "WaveActiveSum", "simd_sum" },
+            { "prefix_sum", "WavePrefixSum", "simd_prefix_exclusive_sum" },
+            { "min", "WaveActiveMin", "simd_min" },
+            { "max", "WaveActiveMax", "simd_max" },
+            { "read_first", "WaveReadLaneFirst", "simd_broadcast_first" },
+            { "all", "WaveActiveAllTrue", "simd_all" },
+            { "any", "WaveActiveAnyTrue", "simd_any" },
+        };
+        auto x = X(an[0]);
+        for (auto &w : ws)
+            if (op == w.op) return cat(hlsl() ? w.h : w.m, "(", x, ")");
+        if (op == "read_lane") {
+            auto lane = X(an[1]);
+            return hlsl() ? cat("WaveReadLaneAt(", x, ", ", lane, ")")
+                          : cat("simd_shuffle(", x, ", ushort(", lane, "))");
+        }
+        if (op == "count")
+            return hlsl() ? cat("WaveActiveCountBits(", x, ")")
+                          : cat("uint(popcount(static_cast<simd_vote::vote_t>(simd_ballot(", x, "))))");
+        if (op == "prefix_count")
+            return hlsl() ? cat("WavePrefixCountBits(", x, ")")
+                          : cat("simd_prefix_exclusive_sum((", x, ") ? 1u : 0u)");
+        Fail(c, cat("internal: unknown wave intrinsic wave_", op));
     }
 
     // ------------------------------------------------------------------
@@ -1123,8 +1295,12 @@ struct GpuEmitter {
             case NK_Continue: L("continue;"); return;
             case NK_FnDecl: Fail(n, "nested functions do not run on the GPU yet");
             case NK_Call: {
+                // A call whose value is a temporary did its work in the
+                // statements before it.
                 auto x = X(n);
-                if (!x.empty()) L(cat(x, ";"));
+                auto temp = !x.empty() && x[0] == 't' &&
+                            x.find_first_not_of("0123456789", 1) == string::npos;
+                if (!x.empty() && !temp) L(cat(x, ";"));
                 return;
             }
             default: {
@@ -1718,6 +1894,7 @@ struct GpuEmitter {
             out += iface;
             out += decls;
             out += tabledefs;
+            for (auto &[n, t] : shared) out += cat("groupshared ", t, " ", n, ";\n");
             out += "\nstatic uint3 gs_dispatch_thread_id;\nstatic uint3 gs_group_id;\n"
                    "static uint3 gs_group_thread_id;\nstatic uint gs_group_index;\n"
                    "static uint gs_vertex_index;\nstatic uint gs_instance_index;\n"
@@ -1754,7 +1931,10 @@ struct GpuEmitter {
             out += "struct GsCtx {\n    device const ulong *heap;\n    device const ulong *samplers;\n"
                    "    uint3 dispatch_thread_id;\n    uint3 group_id;\n    uint3 group_thread_id;\n"
                    "    uint group_index;\n    uint vertex_index;\n    uint instance_index;\n"
-                   "    float4 frag_coord;\n    bool front_facing;\n};\n\n";
+                   "    float4 frag_coord;\n    bool front_facing;\n    uint simd_lane;\n"
+                   "    uint simd_size;\n";
+            for (auto &[n, t] : shared) out += cat("    threadgroup ", t, " *", n, ";\n");
+            out += "};\n\n";
             out += tabledefs;
             out += helperdefs;
             out += fndefs;
@@ -1775,6 +1955,9 @@ struct GpuEmitter {
                           "uint gi [[thread_index_in_threadgroup]]";
                 setup += "    gs.dispatch_thread_id = dtid;\n    gs.group_id = gid;\n"
                          "    gs.group_thread_id = gtid;\n    gs.group_index = gi;\n";
+                for (auto &[n, t] : shared)
+                    setup += cat("    threadgroup ", t, " gs_tg_", n, ";\n    gs.", n, " = &gs_tg_",
+                                 n, ";\n");
             } else if (stage == GPU_VERTEX) {
                 kind = "vertex";
                 params += ", uint vid [[vertex_id]], uint iid [[instance_id]]";
@@ -1784,6 +1967,11 @@ struct GpuEmitter {
                 params = cat("gs_fragment_in gs_in [[stage_in]], bool ff [[front_facing]], ",
                              params);
                 setup += "    gs.frag_coord = gs_in.position;\n    gs.front_facing = ff;\n";
+            }
+            if (simd && stage != GPU_VERTEX) {
+                params += ", uint gs_sl [[thread_index_in_simdgroup]], "
+                          "uint gs_ss [[threads_per_simdgroup]]";
+                setup += "    gs.simd_lane = gs_sl;\n    gs.simd_size = gs_ss;\n";
             }
             out += cat(kind, " ", ret, " ", name, "(", params, ") {\n", setup, st.out, "}\n");
         }

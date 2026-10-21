@@ -113,6 +113,8 @@ struct GsCtx {
     uint instance_index;
     float4 frag_coord;
     bool front_facing;
+    uint simd_lane;
+    uint simd_size;
 };
 
 int gs_emod_int(int a, int b) {

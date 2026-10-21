@@ -215,6 +215,8 @@ struct GsCtx {
     uint instance_index;
     float4 frag_coord;
     bool front_facing;
+    uint simd_lane;
+    uint simd_size;
 };
 
 constant gs_array_u32_4 WEIGHTS = { { 0u, 21u, 43u, 64u } };

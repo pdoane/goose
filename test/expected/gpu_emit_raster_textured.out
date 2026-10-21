@@ -68,7 +68,7 @@ static float4 gs_frag_coord;
 static bool gs_front_facing;
 
 float4 gpu_sample(gpu_Texture2D_vec4_f32 t, gpu_Sampler s, float2 uv) {
-#line 64 "gpu_shader.goose"
+#line 136 "gpu_shader.goose"
     Texture2D<float4> t0 = ResourceDescriptorHeap[t.index];
     SamplerState t1 = SamplerDescriptorHeap[s.index];
     return t0.Sample(t1, uv);
@@ -156,10 +156,12 @@ struct GsCtx {
     uint instance_index;
     float4 frag_coord;
     bool front_facing;
+    uint simd_lane;
+    uint simd_size;
 };
 
 float4 gpu_sample(thread GsCtx &gs, gpu_Texture2D_vec4_f32 t, gpu_Sampler s, float2 uv) {
-#line 64 "gpu_shader.goose"
+#line 136 "gpu_shader.goose"
     return reinterpret_cast<device const GsHeapTexture2D_float *>(gs.heap)[t.index].r.sample(reinterpret_cast<device const GsHeapSampler_s *>(gs.samplers)[s.index].r, uv);
 }
 
@@ -245,7 +247,7 @@ static float4 gs_frag_coord;
 static bool gs_front_facing;
 
 float4 gpu_sample(gpu_Texture2D_vec4_f32 t, gpu_Sampler s, float2 uv) {
-#line 64 "gpu_shader.goose"
+#line 136 "gpu_shader.goose"
     Texture2D<float4> t0 = ResourceDescriptorHeap[t.index];
     SamplerState t1 = SamplerDescriptorHeap[s.index];
     return t0.Sample(t1, uv);
@@ -347,7 +349,7 @@ Vertex gpu_load(gpu_StructuredBuffer_Vertex b, uint i) {
 }
 
 float4 gpu_mul(gpu_mat4 m, float4 v) {
-#line 78 "gpu_shader.goose"
+#line 150 "gpu_shader.goose"
     return ((((m.c0 * v.x) + (m.c1 * v.y)) + (m.c2 * v.z)) + (m.c3 * v.w));
 }
 
@@ -431,6 +433,8 @@ struct GsCtx {
     uint instance_index;
     float4 frag_coord;
     bool front_facing;
+    uint simd_lane;
+    uint simd_size;
 };
 
 Vertex gpu_load(thread GsCtx &gs, gpu_StructuredBuffer_Vertex b, uint i) {
@@ -439,7 +443,7 @@ Vertex gpu_load(thread GsCtx &gs, gpu_StructuredBuffer_Vertex b, uint i) {
 }
 
 float4 gpu_mul(thread GsCtx &gs, gpu_mat4 m, float4 v) {
-#line 78 "gpu_shader.goose"
+#line 150 "gpu_shader.goose"
     return ((((float4(m.c0) * v.x) + (float4(m.c1) * v.y)) + (float4(m.c2) * v.z)) + (float4(m.c3) * v.w));
 }
 
@@ -531,7 +535,7 @@ Vertex gpu_load(gpu_StructuredBuffer_Vertex b, uint i) {
 }
 
 float4 gpu_mul(gpu_mat4 m, float4 v) {
-#line 78 "gpu_shader.goose"
+#line 150 "gpu_shader.goose"
     return ((((m.c0 * v.x) + (m.c1 * v.y)) + (m.c2 * v.z)) + (m.c3 * v.w));
 }
 

@@ -83,6 +83,8 @@ struct GsCtx {
     uint instance_index;
     float4 frag_coord;
     bool front_facing;
+    uint simd_lane;
+    uint simd_size;
 };
 
 void gpu_store(thread GsCtx &gs, gpu_RWStructuredBuffer_vec4_f32 b, uint i, float4 v) {

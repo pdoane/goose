@@ -31,6 +31,78 @@ fn load<T>(b: StructuredBuffer<T>, i: u32) -> T { gpu_load<T>(b.index, i) }
 fn load<T>(b: RWStructuredBuffer<T>, i: u32) -> T { gpu_load<T>(b.index, i) }
 fn store<T>(b: RWStructuredBuffer<T>, i: u32, v: T) { gpu_store(b.index, i, v); }
 
+// Atomics on a buffer of u32: element i changed by v, the value it held
+// before returned. compare_exchange stores v where element i equals
+// `compare`, and returns what it held either way.
+extern "gs_shader_atomic_add" fn atomic_add_at(index: u32, i: u32, v: u32) -> u32;
+extern "gs_shader_atomic_min" fn atomic_min_at(index: u32, i: u32, v: u32) -> u32;
+extern "gs_shader_atomic_max" fn atomic_max_at(index: u32, i: u32, v: u32) -> u32;
+extern "gs_shader_atomic_and" fn atomic_and_at(index: u32, i: u32, v: u32) -> u32;
+extern "gs_shader_atomic_or" fn atomic_or_at(index: u32, i: u32, v: u32) -> u32;
+extern "gs_shader_atomic_xor" fn atomic_xor_at(index: u32, i: u32, v: u32) -> u32;
+extern "gs_shader_atomic_exchange" fn atomic_exchange_at(index: u32, i: u32, v: u32) -> u32;
+extern "gs_shader_atomic_cas" fn atomic_cas_at(index: u32, i: u32, compare: u32, v: u32) -> u32;
+fn atomic_add(b: RWStructuredBuffer<u32>, i: u32, v: u32) -> u32 { atomic_add_at(b.index, i, v) }
+fn atomic_min(b: RWStructuredBuffer<u32>, i: u32, v: u32) -> u32 { atomic_min_at(b.index, i, v) }
+fn atomic_max(b: RWStructuredBuffer<u32>, i: u32, v: u32) -> u32 { atomic_max_at(b.index, i, v) }
+fn atomic_and(b: RWStructuredBuffer<u32>, i: u32, v: u32) -> u32 { atomic_and_at(b.index, i, v) }
+fn atomic_or(b: RWStructuredBuffer<u32>, i: u32, v: u32) -> u32 { atomic_or_at(b.index, i, v) }
+fn atomic_xor(b: RWStructuredBuffer<u32>, i: u32, v: u32) -> u32 { atomic_xor_at(b.index, i, v) }
+fn atomic_exchange(b: RWStructuredBuffer<u32>, i: u32, v: u32) -> u32 {
+    atomic_exchange_at(b.index, i, v)
+}
+fn compare_exchange(b: RWStructuredBuffer<u32>, i: u32, compare: u32, v: u32) -> u32 {
+    atomic_cas_at(b.index, i, compare, v)
+}
+
+// Memory a compute entry's group shares, a global `var` of this type:
+// `var tile: gpu::GroupShared<u32[256]>;`, read and written through
+// `tile.value`. Each group has its own, uninitialized, at most 32 KiB in
+// all; group_barrier() waits for the group's invocations and makes their
+// writes to it visible, device_barrier() their writes to buffers and
+// textures too. Atomics on a u32 or i32 in it are the builtins
+// gpu_atomic(op, target, v), op one of the ATOMIC_ constants, and
+// gpu_atomic_cas(target, compare, v), each returning the old value.
+struct GroupShared<T> { value: T }
+extern "gs_shader_group_barrier" fn group_barrier();
+extern "gs_shader_device_barrier" fn device_barrier();
+let ATOMIC_ADD = 0;
+let ATOMIC_MIN = 1;
+let ATOMIC_MAX = 2;
+let ATOMIC_AND = 3;
+let ATOMIC_OR = 4;
+let ATOMIC_XOR = 5;
+let ATOMIC_EXCHANGE = 6;
+
+// The wave (SIMD group) an invocation runs in, compute and fragment
+// entries: its lanes run in lockstep, and these combine a value across the
+// lanes active. wave_size() varies by device (32 on Apple GPUs, 32 or 64
+// elsewhere); the prefix forms are exclusive, lanes below this one.
+extern "gs_shader_wave_lane" fn wave_lane() -> u32;
+extern "gs_shader_wave_size" fn wave_size() -> u32;
+extern "gs_shader_wave_sum" fn wave_sum(x: u32) -> u32;
+extern "gs_shader_wave_sum" fn wave_sum(x: i32) -> i32;
+extern "gs_shader_wave_sum" fn wave_sum(x: f32) -> f32;
+extern "gs_shader_wave_prefix_sum" fn wave_prefix_sum(x: u32) -> u32;
+extern "gs_shader_wave_prefix_sum" fn wave_prefix_sum(x: i32) -> i32;
+extern "gs_shader_wave_prefix_sum" fn wave_prefix_sum(x: f32) -> f32;
+extern "gs_shader_wave_min" fn wave_min(x: u32) -> u32;
+extern "gs_shader_wave_min" fn wave_min(x: i32) -> i32;
+extern "gs_shader_wave_min" fn wave_min(x: f32) -> f32;
+extern "gs_shader_wave_max" fn wave_max(x: u32) -> u32;
+extern "gs_shader_wave_max" fn wave_max(x: i32) -> i32;
+extern "gs_shader_wave_max" fn wave_max(x: f32) -> f32;
+extern "gs_shader_wave_read_first" fn wave_read_first(x: u32) -> u32;
+extern "gs_shader_wave_read_first" fn wave_read_first(x: i32) -> i32;
+extern "gs_shader_wave_read_first" fn wave_read_first(x: f32) -> f32;
+extern "gs_shader_wave_read_lane" fn wave_read_lane(x: u32, lane: u32) -> u32;
+extern "gs_shader_wave_read_lane" fn wave_read_lane(x: i32, lane: u32) -> i32;
+extern "gs_shader_wave_read_lane" fn wave_read_lane(x: f32, lane: u32) -> f32;
+extern "gs_shader_wave_all" fn wave_all(b: bool) -> bool;
+extern "gs_shader_wave_any" fn wave_any(b: bool) -> bool;
+extern "gs_shader_wave_count" fn wave_count(b: bool) -> u32;          // lanes where b
+extern "gs_shader_wave_prefix_count" fn wave_prefix_count(b: bool) -> u32;
+
 // A fragment entry's pixel: its window position (x and y in pixels from the
 // top left, z its depth), whether its triangle faces the camera, and
 // discarding it.

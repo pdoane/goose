@@ -215,6 +215,27 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 Error(c, cat("gpu_store_texel writes a flat value, not ", TypeStr(vv.type)));
             return VoidVal();
         }
+        case B_GPU_ATOMIC: case B_GPU_ATOMIC_CAS: {
+            // gpu_atomic(op, target, v) and gpu_atomic_cas(target, compare,
+            // v): an atomic change to a u32 or i32 in group memory, the old
+            // value returned. That the target is one is the GPU pass's to
+            // check (src/gpu.h), where an lvalue's root is known.
+            size_t t0 = 0;
+            if (d.kind == B_GPU_ATOMIC) {
+                CheckArg(args[0], ast.inttypes[IS_I32]);
+                t0 = 1;
+            }
+            auto tv = CheckValue(args[t0], nullptr);
+            auto t = tv.type;
+            if (t->kind == TY_REF) t = t->ref->sub;
+            if (t->kind != TY_INT || (t->intstorage != IS_U32 && t->intstorage != IS_I32))
+                Error(c, cat(d.name, " changes a u32 or an i32, not ", TypeStr(t)));
+            for (size_t i = t0 + 1; i < args.size(); i++) CheckArg(args[i], t);
+            c->rettypes.push_back(t);
+            Val v;
+            v.type = t;
+            return v;
+        }
         case B_GPU_LOAD: {
             // gpu_load<T>(buffer, i): element i of a buffer of T, given by
             // its heap index, at T's packed size apart and in its Goose
