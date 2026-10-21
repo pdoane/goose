@@ -24,6 +24,7 @@ windows; without SDL3 it builds with devices that have no window.
     goose test/updates.goose          updates to resources in use, in flight
     goose test/rays.goose             inline ray queries, where the device has them
     goose examples/cube.goose         gfx's cube, in a window
+    goose examples/raytrace.goose     spinning cubes with ray-traced shadows and occlusion
 
 `GOOSE_GPU_BACKEND=vulkan` picks Vulkan over Metal on a Mac, where the
 driver is KosmicKrisp; `GOOSE_GPU_VALIDATION=1` turns on Vulkan's

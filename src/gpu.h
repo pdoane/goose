@@ -127,7 +127,9 @@ struct GpuEmitter {
         if (t->kind == TY_BOOL) return "bool";
         if (t->kind == TY_FLT) {
             if (t->fltstorage != FS_F32)
-                Fail(l, "f64 does not run on the GPU: MSL has no doubles (docs/design/gpu.md §5.2)");
+                Fail(l, "f64 does not run on the GPU: MSL has no doubles. A float computed from "
+                        "literals is an f64 where nothing gives it a type, so write `: f32` on "
+                        "the let (docs/design/gpu.md §5.2)");
             return "float";
         }
         if (t->kind == TY_INT) {
