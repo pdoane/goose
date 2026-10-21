@@ -193,8 +193,16 @@ one above it averaged 2x2 (exactly, where the mip above is of even size):
 Vulkan blits with a linear filter, and Metal runs a small kernel of the
 package's own, since Metal 4's `generateMipmapsForTexture` takes one texel
 of each 2x2 rather than filtering them. Shaders choose a mip with
-`sample_level` or `texel(t, xy, mip)`; writing one mip from a shader, which
-needs a view of it, is not built.
+`sample_level` or `texel(t, xy, mip)`, and write one through
+`storage_mip<T>(t, mip)`.
+
+A texture that shaders both sample and write has two handles, since
+Vulkan's and Direct3D 12's descriptors differ by use where Metal's do
+not: `sampled<T>(t)` reads it, and `storage<T>(t)` or `storage_mip<T>(t,
+mip)` writes it through a view of one mip, a heap slot of its own made the
+first time it is asked for and released with the texture. Barriers stay
+on the texture. `image_texture(bytes, flags)` is `load_texture` from a
+PNG's bytes in memory, as a glTF file holds its images.
 
 A handle is its heap index, so the value the host holds is the value a
 shader reads: a struct of handles written into a buffer is a material table

@@ -1094,12 +1094,37 @@ static int vk_accel_create(uint32_t slot, const goose_gpu_primitive_accel_desc *
 static int vk_accel_build(uint32_t slot, int64_t n) { (void)slot; (void)n; return 0; }
 static uint64_t vk_accel_reference(uint32_t slot) { (void)slot; return 0; }
 
+/* A storage view: an image view of one mip, written as a storage image in
+   general layout. */
+static int vk_view_create(uint32_t view, uint32_t texture, int mip) {
+    vkimage *im = &images[texture];
+    vkimage *v = &images[view];
+    memset(v, 0, sizeof *v);
+    v->image = im->image;
+    v->format = im->format;
+    v->aspect = im->aspect;
+    VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = im->image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = im->format;
+    vci.subresourceRange = (VkImageSubresourceRange) { im->aspect, (uint32_t)mip, 1, 0, 1 };
+    if (!check(vkCreateImageView(device, &vci, NULL, &v->view), "vkCreateImageView")) return 0;
+    VkDescriptorImageInfo info = { VK_NULL_HANDLE, v->view, VK_IMAGE_LAYOUT_GENERAL };
+    write_heap(view, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, NULL, &info);
+    return 1;
+}
+
 static void vk_release(uint32_t slot, int kind) {
     int texture = kind == GOOSE_GPU_KIND_TEXTURE;
     if (kind == GOOSE_GPU_KIND_ACCEL) return;
     /* Released once the work submitted so far is done (§2, deferred
        destruction); this backend waits for it. */
     vkDeviceWaitIdle(device);
+    if (kind == GOOSE_GPU_KIND_VIEW) {
+        vkDestroyImageView(device, images[slot].view, NULL);
+        memset(&images[slot], 0, sizeof images[slot]);
+        return;
+    }
     if (texture) {
         vkimage *im = &images[slot];
         if (!im->memory) {          /* a swap chain image, the swap chain's to destroy */
@@ -1537,7 +1562,8 @@ static void vk_wait(uint64_t fence) {
 const goose_gpu_backend goose_gpu_vulkan = {
     "vulkan",
     vk_open, vk_close,
-    vk_buffer_create, vk_texture_create, vk_release, vk_update_buffer, vk_update_texture,
+    vk_buffer_create, vk_texture_create, vk_release, vk_view_create, vk_update_buffer,
+    vk_update_texture,
     vk_generate_mips, vk_copy_to_texture,
     vk_ray_query, vk_accel_create, vk_accel_build, vk_accel_reference,
     vk_compute_create, vk_raster_create, vk_pipeline_release,

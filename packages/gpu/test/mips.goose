@@ -55,6 +55,9 @@ fn main() {
     gpu::wait(gpu::submit());
     guard file_exists(path) else { abort("gpu: save_png wrote no file once its fence passed"); }
     let loaded = gpu::load_texture(path, gpu::LOAD_MIPS);
+    var file: u8[>..] = [];
+    read_file(path, file);
+    let frommem = gpu::image_texture(file, 0);
     delete_file(path);
     guard loaded.index != 0 else { abort(str("gpu: load_texture: ", gpu::error())); }
     if gpu::texture_info(loaded).mips != 3 {
@@ -72,6 +75,7 @@ fn main() {
     gpu::end_compute();
     let texels = gpu::read_buffer(dst, 0, 4 * 16);
     let back = gpu::read_texture(loaded);
+    let backmem = gpu::read_texture(frommem);
     gpu::wait(gpu::submit());
 
     var got: float4[>..] = [];
@@ -90,7 +94,13 @@ fn main() {
     }
     var bytes: u8[>..] = [];
     guard gpu::bytes(back, bytes) else { abort("gpu: a read back is not ready"); }
+    var memory: u8[>..] = [];
+    guard gpu::bytes(backmem, memory) else { abort("gpu: a read back is not ready"); }
     for i in img.len {
+        if memory[i] != img[i] {
+            if wrong < 8 { print("byte ", i, " from memory: ", memory[i], " not ", img[i]); }
+            wrong++;
+        }
         if bytes[i] != img[i] {
             if wrong < 8 { print("loaded byte ", i, ": ", bytes[i], " not ", img[i]); }
             wrong++;

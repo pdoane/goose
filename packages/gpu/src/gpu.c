@@ -18,7 +18,7 @@ static char lasterror[1024];
 static int misused;
 
 /* Heap slots: what each holds, and its size or texture. */
-enum { SLOT_FREE, SLOT_BUFFER, SLOT_TEXTURE, SLOT_ACCEL };
+enum { SLOT_FREE, SLOT_BUFFER, SLOT_TEXTURE, SLOT_ACCEL, SLOT_VIEW };
 static uint8_t accelinstance[GOOSE_GPU_HEAP_SLOTS];    /* an instance structure */
 static int64_t accelmax[GOOSE_GPU_HEAP_SLOTS];
 static uint8_t slotkind[GOOSE_GPU_HEAP_SLOTS];
@@ -329,6 +329,11 @@ void goose_gpu_close(void) {
     for (int i = 0; i < GOOSE_GPU_MAX_PIPELINES; i++)
         if (pipelines[i].used) release_pipeline(&pipelines[i]);
     for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++)
+        if (slotkind[s] == SLOT_VIEW) {
+            backend->release(s, GOOSE_GPU_KIND_VIEW);
+            slotkind[s] = SLOT_FREE;
+        }
+    for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++)
         if (slotkind[s]) {
             backend->release(s, slotkind[s] - SLOT_BUFFER);
             slotkind[s] = SLOT_FREE;
@@ -418,6 +423,7 @@ uint32_t goose_gpu_texture(goose_gpu_texture_desc d, goose_gpu_bytes data) {
     if (!slot) return 0;
     /* Known before the backend makes it: its upload reads the description. */
     slotkind[slot] = SLOT_TEXTURE;
+    memset(&textures[slot], 0, sizeof textures[slot]);
     textures[slot].desc = d;
     if (!backend->texture_create(slot, &d, data.len ? data.data : NULL, data.len)) {
         slotkind[slot] = SLOT_FREE;
@@ -498,26 +504,18 @@ void goose_gpu_generate_mips(uint32_t slot) {
 /* gfx's load_texture flags. */
 enum { LOAD_MIPS = 1, LOAD_SRGB = 2 };
 
-/* A PNG or .bmp as an RGBA8 texture, uploaded as texture(desc, data) is,
-   with its mips filled in the same upload with LOAD_MIPS. */
-uint32_t goose_gpu_load_texture(goose_gpu_bytes path, int64_t flags) {
-    if (!ready("gpu::load_texture")) return 0;
 #ifdef GOOSE_GPU_SDL
-    char buf[1024];
-    size_t n = path.len < 0 ? 0 : (size_t)path.len;
-    if (n >= sizeof buf) n = sizeof buf - 1;
-    if (n) memcpy(buf, path.data, n);
-    buf[n] = 0;
-    int bmp = n >= 4 && SDL_strcasecmp(buf + n - 4, ".bmp") == 0;
-    SDL_Surface *loaded = bmp ? SDL_LoadBMP(buf) : SDL_LoadPNG(buf);
+/* An image SDL loaded as an RGBA8 texture, uploaded as texture(desc, data)
+   is, with its mips filled in the same upload with LOAD_MIPS. */
+static uint32_t surface_texture(SDL_Surface *loaded, int64_t flags, const char *what) {
     if (!loaded) {
-        goose_gpu_fail("cannot load %s: %s", buf, SDL_GetError());
+        goose_gpu_fail("cannot load %s: %s", what, SDL_GetError());
         return 0;
     }
     SDL_Surface *rgba = SDL_ConvertSurface(loaded, SDL_PIXELFORMAT_RGBA32);
     SDL_DestroySurface(loaded);
     if (!rgba) {
-        goose_gpu_fail("cannot convert %s: %s", buf, SDL_GetError());
+        goose_gpu_fail("cannot convert %s: %s", what, SDL_GetError());
         return 0;
     }
     /* Rows as the surface has them, which may be padded. */
@@ -539,6 +537,20 @@ uint32_t goose_gpu_load_texture(goose_gpu_bytes path, int64_t flags) {
         return 0;
     }
     return slot;
+}
+#endif
+
+/* A PNG or .bmp file as a texture. */
+uint32_t goose_gpu_load_texture(goose_gpu_bytes path, int64_t flags) {
+    if (!ready("gpu::load_texture")) return 0;
+#ifdef GOOSE_GPU_SDL
+    char buf[1024];
+    size_t n = path.len < 0 ? 0 : (size_t)path.len;
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    if (n) memcpy(buf, path.data, n);
+    buf[n] = 0;
+    int bmp = n >= 4 && SDL_strcasecmp(buf + n - 4, ".bmp") == 0;
+    return surface_texture(bmp ? SDL_LoadBMP(buf) : SDL_LoadPNG(buf), flags, buf);
 #else
     (void)path; (void)flags;
     goose_gpu_fail("this build of the gpu package has no SDL3, so no image files");
@@ -546,14 +558,65 @@ uint32_t goose_gpu_load_texture(goose_gpu_bytes path, int64_t flags) {
 #endif
 }
 
+/* A PNG or .bmp file's bytes, from memory, as a texture. */
+uint32_t goose_gpu_image_texture(goose_gpu_bytes data, int64_t flags) {
+    if (!ready("gpu::image_texture")) return 0;
+#ifdef GOOSE_GPU_SDL
+    SDL_IOStream *io = SDL_IOFromConstMem(data.data, (size_t)data.len);
+    int bmp = data.len >= 2 && data.data[0] == 'B' && data.data[1] == 'M';
+    return surface_texture(bmp ? SDL_LoadBMP_IO(io, true) : SDL_LoadPNG_IO(io, true), flags,
+                           "an image");
+#else
+    (void)data; (void)flags;
+    goose_gpu_fail("this build of the gpu package has no SDL3, so no image files");
+    return 0;
+#endif
+}
+
 void goose_gpu_release(uint32_t slot) {
     if (!backend || !slot) return;
-    if (slot >= GOOSE_GPU_HEAP_SLOTS || !slotkind[slot]) {
+    if (slot >= GOOSE_GPU_HEAP_SLOTS || !slotkind[slot] || slotkind[slot] == SLOT_VIEW) {
         goose_gpu_misuse("gpu::release of %u, which is no buffer or texture", slot);
         return;
     }
+    if (slotkind[slot] == SLOT_TEXTURE)
+        for (int m = 0; m < 16; m++) {
+            uint32_t v = textures[slot].views[m];
+            if (v && v != slot) {
+                backend->release(v, GOOSE_GPU_KIND_VIEW);
+                slotkind[v] = SLOT_FREE;
+            }
+        }
     backend->release(slot, slotkind[slot] - SLOT_BUFFER);
     slotkind[slot] = SLOT_FREE;
+}
+
+/* The slot shaders write mip `mip` of a storage texture through (§3): the
+   texture's own for mip 0 of one that is not sampled, else a view made
+   the first time it is asked for, released with the texture. */
+uint32_t goose_gpu_storage_view(uint32_t slot, int64_t mip) {
+    if (!ready("gpu::storage")) return 0;
+    goose_gpu_tex *t = slot < GOOSE_GPU_HEAP_SLOTS && slotkind[slot] == SLOT_TEXTURE
+                           ? &textures[slot] : NULL;
+    if (!t || !(t->desc.usage & GOOSE_GPU_STORAGE) || mip < 0 || mip >= t->desc.mips) {
+        goose_gpu_misuse("gpu::storage of texture %u, mip %lld: a texture made with STORAGE, "
+                         "and one of its mips", slot, (long long)mip);
+        return 0;
+    }
+    if (t->views[mip]) return t->views[mip];
+    if (mip == 0 && !(t->desc.usage & GOOSE_GPU_SAMPLED) && t->desc.mips == 1) {
+        t->views[0] = slot;
+        return slot;
+    }
+    uint32_t v = free_slot();
+    if (!v) return 0;
+    slotkind[v] = SLOT_VIEW;
+    if (!backend->view_create(v, slot, (int)mip)) {
+        slotkind[v] = SLOT_FREE;
+        return 0;
+    }
+    t->views[mip] = v;
+    return v;
 }
 
 /* Ray tracing (§7). */

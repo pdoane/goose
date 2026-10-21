@@ -141,8 +141,10 @@ extern "goose_gpu_release" fn release_native(index: u32);
 extern "goose_gpu_update_buffer" fn update_buffer_native(index: u32, offset: i64,
                                                          data: const u8[:]) -> bool;
 extern "goose_gpu_update_texture" fn update_texture_native(index: u32, data: const u8[:]) -> bool;
+extern "goose_gpu_storage_view" fn storage_view_native(index: u32, mip: i64) -> u32;
 extern "goose_gpu_texture_info" fn texture_info_into(index: u32, out: TextureDesc&) -> bool;
 extern "goose_gpu_load_texture" fn load_texture_native(path: const u8[:], flags: i64) -> u32;
+extern "goose_gpu_image_texture" fn image_texture_native(data: const u8[:], flags: i64) -> u32;
 extern "goose_gpu_generate_mips" fn generate_mips_native(index: u32);
 extern "goose_gpu_save_png" fn save_png_native(index: u32, path: const u8[:]) -> bool;
 extern "goose_gpu_compute_pipeline" fn compute_pipeline_native(library: const u8[:]) -> u32;
@@ -277,6 +279,11 @@ fn texture_info(t: Texture) -> TextureDesc {
 fn load_texture(path: const u8[:], flags: i64) -> Texture {
     Texture { load_texture_native(path, flags) }
 }
+// The same from a PNG's (or a .bmp's) bytes in memory, as a glTF file
+// holds its images.
+fn image_texture(data: const u8[:], flags: i64) -> Texture {
+    Texture { image_texture_native(data, flags) }
+}
 
 // Fills mips 1 and up from mip 0, where the work is recorded: outside
 // passes, of a sampled texture of a format that filters, from whatever
@@ -314,7 +321,14 @@ fn update_texture(t: Texture, data: const u8[:]) -> bool { update_texture_native
 fn structured<T>(b: Buffer) -> StructuredBuffer<T> { StructuredBuffer<T> { b.index } }
 fn rw_structured<T>(b: Buffer) -> RWStructuredBuffer<T> { RWStructuredBuffer<T> { b.index } }
 fn sampled<T>(t: Texture) -> Texture2D<T> { Texture2D<T> { t.index } }
-fn storage<T>(t: Texture) -> RWTexture2D<T> { RWTexture2D<T> { t.index } }
+// A storage texture as shaders write it: mip 0, or the mip asked for. A
+// texture both sampled and written has two handles, as Vulkan's and
+// Direct3D's descriptors differ by use: sampled<T>(t) to read it,
+// storage<T>(t) to write it, barriers on t between them.
+fn storage<T>(t: Texture) -> RWTexture2D<T> { RWTexture2D<T> { storage_view_native(t.index, 0) } }
+fn storage_mip<T>(t: Texture, mip: i64) -> RWTexture2D<T> {
+    RWTexture2D<T> { storage_view_native(t.index, mip) }
+}
 
 // The pipeline running the compute entry point F (docs/design/gpu.md §5.1).
 fn compute_pipeline<F>() -> ComputePipeline {

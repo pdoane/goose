@@ -49,6 +49,7 @@ static uint64_t uniformgen = UINT64_MAX;
 static id<MTLBuffer> buffers[GOOSE_GPU_HEAP_SLOTS];
 static id<MTLTexture> textures[GOOSE_GPU_HEAP_SLOTS];
 static NSArray<id<MTLTexture>> *mipviews[GOOSE_GPU_HEAP_SLOTS];  /* one per mip, once made */
+static id<MTLTexture> views[GOOSE_GPU_HEAP_SLOTS];                /* storage views' slots */
 static id<MTLComputePipelineState> mipstate;
 static id<MTL4ArgumentTable> miptable;
 static id<MTLAccelerationStructure> accels[GOOSE_GPU_HEAP_SLOTS];
@@ -596,10 +597,32 @@ static int mtl_accel_build(uint32_t slot, int64_t instances) {
 
 static uint64_t mtl_accel_reference(uint32_t slot) { return accels[slot].gpuResourceID._impl; }
 
+/* A storage view: a texture view of one mip, by resource ID in the heap,
+   resident through its texture. */
+static int mtl_view_create(uint32_t view, uint32_t texture, int mip) {
+    id<MTLTexture> t = textures[texture];
+    id<MTLTexture> v = [t newTextureViewWithPixelFormat:t.pixelFormat
+                                            textureType:MTLTextureType2D
+                                                 levels:NSMakeRange((NSUInteger)mip, 1)
+                                                 slices:NSMakeRange(0, 1)];
+    if (!v) {
+        goose_gpu_fail("Metal made no view of mip %d", mip);
+        return 0;
+    }
+    views[view] = v;
+    ((uint64_t *)heap.contents)[view] = v.gpuResourceID._impl;
+    return 1;
+}
+
 static void mtl_release(uint32_t slot, int kind) {
     /* Released once the work submitted so far is done (§2, deferred
        destruction); this backend waits for it. */
     mtl_wait(submitted);
+    if (kind == GOOSE_GPU_KIND_VIEW) {
+        views[slot] = nil;
+        ((uint64_t *)heap.contents)[slot] = 0;
+        return;
+    }
     int texture = kind == GOOSE_GPU_KIND_TEXTURE;
     if (kind == GOOSE_GPU_KIND_ACCEL) {
         [residency removeAllocation:accels[slot]];
@@ -1037,7 +1060,8 @@ static uint64_t mtl_submit(int present) {
 const goose_gpu_backend goose_gpu_metal = {
     "metal",
     mtl_open, mtl_close,
-    mtl_buffer_create, mtl_texture_create, mtl_release, mtl_update_buffer, mtl_update_texture,
+    mtl_buffer_create, mtl_texture_create, mtl_release, mtl_view_create, mtl_update_buffer,
+    mtl_update_texture,
     mtl_generate_mips, mtl_copy_to_texture,
     mtl_ray_query, mtl_accel_create, mtl_accel_build, mtl_accel_reference,
     mtl_compute_create, mtl_raster_create, mtl_pipeline_release,

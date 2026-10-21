@@ -104,6 +104,10 @@ typedef struct {
     goose_gpu_texture_desc desc;
     int access;             /* GOOSE_GPU_ACCESS_*, as the last barrier left it */
     int submitted;          /*   and as the work submitted so far leaves it */
+    /* The slots of the views shaders write each mip through (storage_mip),
+       0 until one is asked for; a storage texture that is not sampled
+       writes mip 0 through its own slot. */
+    uint32_t views[16];
 } goose_gpu_tex;
 
 /* A pipeline as the common layer knows it: what its library said, and for
@@ -152,6 +156,9 @@ typedef struct goose_gpu_backend {
                           int64_t len);
     /* `kind` is GOOSE_GPU_KIND_*. */
     void (*release)(uint32_t slot, int kind);
+    /* A view of mip `mip` of the texture in `texture`, in heap slot `view`,
+       that shaders write through (a storage texture's). */
+    int (*view_create)(uint32_t view, uint32_t texture, int mip);
     /* An update (§3): `size` bytes staged now and copied ahead of the next
        submission, ordered after the work already submitted and before the
        work that will be, copies to one resource after each other. A
@@ -221,7 +228,7 @@ typedef struct goose_gpu_backend {
     void (*wait)(uint64_t fence);
 } goose_gpu_backend;
 
-enum { GOOSE_GPU_KIND_BUFFER, GOOSE_GPU_KIND_TEXTURE, GOOSE_GPU_KIND_ACCEL };
+enum { GOOSE_GPU_KIND_BUFFER, GOOSE_GPU_KIND_TEXTURE, GOOSE_GPU_KIND_ACCEL, GOOSE_GPU_KIND_VIEW };
 
 /* The texture in a slot, for the backends; null for none. */
 const goose_gpu_tex *goose_gpu_texture_of(uint32_t slot);
