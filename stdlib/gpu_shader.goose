@@ -135,3 +135,30 @@ fn unpack_unorm4x8(c: u32) -> float4 {
     let scale: f32 = 1.0 / 255.0;
     float4 { c & 255, (c >> 8) & 255, (c >> 16) & 255, (c >> 24) & 255 } * scale
 }
+
+// Ray tracing (docs/design/gpu.md §7): inline queries against an instance
+// acceleration structure, a handle in the resource heap like a texture's.
+// Opaque geometry only, so far. A device without ray queries (caps) makes
+// no pipeline whose entry points reach these.
+struct Accel { index: u32 }
+struct Ray { origin: float3, t_min: f32, dir: float3, t_max: f32 }
+
+let HIT_NONE: u32 = 0;
+let HIT_TRIANGLE: u32 = 1;
+
+// The closest hit: its kind, distance, the instance's index and the id its
+// record gave it, the triangle, which side faced the ray (1 the front), and
+// where on the triangle, as the weights of its second and third corners.
+struct Hit {
+    kind: u32,
+    t: f32,
+    instance: u32,
+    id: u32,
+    primitive: u32,
+    front_face: u32,
+    barycentrics: float2,
+}
+
+extern "gs_shader_trace" fn trace(a: Accel, r: Ray, mask: u32) -> Hit;
+// Whether anything is hit, ending at the first: for shadows and occlusion.
+extern "gs_shader_trace_any" fn trace_any(a: Accel, r: Ray, mask: u32) -> bool;

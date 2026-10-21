@@ -66,6 +66,23 @@ typedef struct {
     int32_t depth_compare, blend;
 } goose_gpu_pipeline_desc;
 
+/* gpu.goose's PrimitiveAccelDesc and InstanceAccelDesc. */
+typedef struct {
+    uint32_t vertices;
+    int64_t vertex_offset, vertex_stride, vertex_count;
+    uint32_t indices;
+    int64_t index_size, index_offset, triangle_count;
+} goose_gpu_primitive_accel_desc;
+
+typedef struct {
+    uint32_t instances;
+    int64_t max;
+} goose_gpu_instance_accel_desc;
+
+/* gpu::Instance, which is Metal's indirect instance descriptor read with a
+   row-major transform (docs/design/gpu.md §7). */
+#define GOOSE_GPU_INSTANCE_SIZE 72
+
 typedef struct {
     uint32_t color[GOOSE_GPU_MAX_TARGETS];
     uint32_t depth;
@@ -126,13 +143,24 @@ typedef struct goose_gpu_backend {
        its steady access, shader reads. */
     int (*texture_create)(uint32_t slot, const goose_gpu_texture_desc *d, const void *data,
                           int64_t len);
-    void (*release)(uint32_t slot, int texture);
+    /* `kind` is GOOSE_GPU_KIND_*. */
+    void (*release)(uint32_t slot, int kind);
     /* An update (§3): `size` bytes staged now and copied ahead of the next
        submission, ordered after the work already submitted and before the
        work that will be, copies to one resource after each other. A
        texture's whole mip 0, which the work submitted left in `access`. */
     int (*update_buffer)(uint32_t slot, int64_t offset, const void *data, int64_t size);
     int (*update_texture)(uint32_t slot, int access, const void *data, int64_t size);
+    /* Ray tracing (§7): whether the device has ray queries, and
+       acceleration structures in heap slots, sized for their description
+       (one of `prim` and `inst`) and built when asked, in order with the
+       work around the build. A bottom-level structure's reference is what
+       a gpu::Instance names it by. */
+    int (*ray_query)(void);
+    int (*accel_create)(uint32_t slot, const goose_gpu_primitive_accel_desc *prim,
+                        const goose_gpu_instance_accel_desc *inst);
+    int (*accel_build)(uint32_t slot, int64_t instances);
+    uint64_t (*accel_reference)(uint32_t slot);
     int (*compute_create)(goose_gpu_pipe *p);
     void *(*raster_create)(goose_gpu_pipe *p, const goose_gpu_targets *targets);
     void (*pipeline_release)(goose_gpu_pipe *p);
@@ -174,6 +202,8 @@ typedef struct goose_gpu_backend {
     uint64_t (*completed)(void);
     void (*wait)(uint64_t fence);
 } goose_gpu_backend;
+
+enum { GOOSE_GPU_KIND_BUFFER, GOOSE_GPU_KIND_TEXTURE, GOOSE_GPU_KIND_ACCEL };
 
 /* The texture in a slot, for the backends; null for none. */
 const goose_gpu_tex *goose_gpu_texture_of(uint32_t slot);

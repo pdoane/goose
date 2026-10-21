@@ -18,7 +18,9 @@ static char lasterror[1024];
 static int misused;
 
 /* Heap slots: what each holds, and its size or texture. */
-enum { SLOT_FREE, SLOT_BUFFER, SLOT_TEXTURE };
+enum { SLOT_FREE, SLOT_BUFFER, SLOT_TEXTURE, SLOT_ACCEL };
+static uint8_t accelinstance[GOOSE_GPU_HEAP_SLOTS];    /* an instance structure */
+static int64_t accelmax[GOOSE_GPU_HEAP_SLOTS];
 static uint8_t slotkind[GOOSE_GPU_HEAP_SLOTS];
 static int64_t slotsize[GOOSE_GPU_HEAP_SLOTS];
 static goose_gpu_tex textures[GOOSE_GPU_HEAP_SLOTS];
@@ -293,7 +295,7 @@ void goose_gpu_close(void) {
         if (pipelines[i].used) release_pipeline(&pipelines[i]);
     for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++)
         if (slotkind[s]) {
-            backend->release(s, slotkind[s] == SLOT_TEXTURE);
+            backend->release(s, slotkind[s] - SLOT_BUFFER);
             slotkind[s] = SLOT_FREE;
         }
     backend->close();
@@ -431,8 +433,81 @@ void goose_gpu_release(uint32_t slot) {
         goose_gpu_misuse("gpu::release of %u, which is no buffer or texture", slot);
         return;
     }
-    backend->release(slot, slotkind[slot] == SLOT_TEXTURE);
+    backend->release(slot, slotkind[slot] - SLOT_BUFFER);
     slotkind[slot] = SLOT_FREE;
+}
+
+/* Ray tracing (§7). */
+uint8_t goose_gpu_ray_query(void) { return backend && backend->ray_query(); }
+
+static int buffer_slot(uint32_t slot) {
+    return slot && slot < GOOSE_GPU_HEAP_SLOTS && slotkind[slot] == SLOT_BUFFER;
+}
+
+static uint32_t new_accel(const goose_gpu_primitive_accel_desc *p,
+                          const goose_gpu_instance_accel_desc *i) {
+    if (!backend->ray_query()) {
+        goose_gpu_fail("the %s device has no ray queries", backend->name);
+        return 0;
+    }
+    uint32_t slot = free_slot();
+    if (!slot) return 0;
+    slotkind[slot] = SLOT_ACCEL;
+    if (!backend->accel_create(slot, p, i)) {
+        slotkind[slot] = SLOT_FREE;
+        return 0;
+    }
+    accelinstance[slot] = i != NULL;
+    accelmax[slot] = i ? i->max : 0;
+    return slot;
+}
+
+uint32_t goose_gpu_primitive_accel(goose_gpu_primitive_accel_desc d) {
+    if (!ready("gpu::primitive_accel")) return 0;
+    int64_t vend = d.vertex_offset + d.vertex_count * d.vertex_stride;
+    int64_t iend = d.index_offset + d.triangle_count * 3 * d.index_size;
+    if (!buffer_slot(d.vertices) || d.vertex_count <= 0 || d.vertex_stride < 12 ||
+        d.triangle_count <= 0 || vend > slotsize[d.vertices] ||
+        (d.indices && (!buffer_slot(d.indices) || (d.index_size != 2 && d.index_size != 4) ||
+                       iend > slotsize[d.indices])) ||
+        (!d.indices && d.triangle_count * 3 > d.vertex_count)) {
+        goose_gpu_misuse("gpu::primitive_accel of %lld triangles over %lld vertices, which its "
+                         "buffers do not hold", (long long)d.triangle_count,
+                         (long long)d.vertex_count);
+        return 0;
+    }
+    return new_accel(&d, NULL);
+}
+
+uint32_t goose_gpu_instance_accel(goose_gpu_instance_accel_desc d) {
+    if (!ready("gpu::instance_accel")) return 0;
+    if (!buffer_slot(d.instances) || d.max <= 0 ||
+        d.max * GOOSE_GPU_INSTANCE_SIZE > slotsize[d.instances]) {
+        goose_gpu_misuse("gpu::instance_accel of %lld instances, which its buffer does not hold",
+                         (long long)d.max);
+        return 0;
+    }
+    return new_accel(NULL, &d);
+}
+
+void goose_gpu_build(uint32_t slot, int64_t instances) {
+    if (!ready("gpu::build") || !outside_pass("gpu::build")) return;
+    if (!slot || slot >= GOOSE_GPU_HEAP_SLOTS || slotkind[slot] != SLOT_ACCEL ||
+        (accelinstance[slot] && (instances < 0 || instances > accelmax[slot]))) {
+        goose_gpu_misuse("gpu::build of %u with %lld instances", slot, (long long)instances);
+        return;
+    }
+    backend->accel_build(slot, instances);
+}
+
+uint64_t goose_gpu_accel_reference(uint32_t slot) {
+    if (!backend || !slot || slot >= GOOSE_GPU_HEAP_SLOTS || slotkind[slot] != SLOT_ACCEL ||
+        accelinstance[slot]) {
+        goose_gpu_misuse("gpu::reference of %u, which is no primitive acceleration structure",
+                         slot);
+        return 0;
+    }
+    return backend->accel_reference(slot);
 }
 
 static uint32_t new_pipeline(goose_gpu_bytes lib, int compute) {
@@ -468,6 +543,11 @@ static uint32_t new_pipeline(goose_gpu_bytes lib, int compute) {
     p->compute = compute;
     p->header = h;
     memcpy(p->entries, lib.data + sizeof h, h.entry_count * sizeof(gs_gpu_lib_entry));
+    if ((h.caps & GS_GPU_CAP_RAY_QUERY) && !backend->ray_query()) {
+        goose_gpu_fail("the pipeline's shaders trace rays, and the %s device has no ray queries",
+                       backend->name);
+        return 0;
+    }
     p->library = malloc((size_t)lib.len);
     memcpy(p->library, lib.data, (size_t)lib.len);
     p->librarylen = lib.len;

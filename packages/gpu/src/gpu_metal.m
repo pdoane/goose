@@ -48,6 +48,9 @@ static uint64_t ringhead, ringcmdstart;
 static uint64_t uniformgen = UINT64_MAX;
 static id<MTLBuffer> buffers[GOOSE_GPU_HEAP_SLOTS];
 static id<MTLTexture> textures[GOOSE_GPU_HEAP_SLOTS];
+static id<MTLAccelerationStructure> accels[GOOSE_GPU_HEAP_SLOTS];
+static id<MTLBuffer> scratch[GOOSE_GPU_HEAP_SLOTS];
+static MTL4AccelerationStructureDescriptor *acceldescs[GOOSE_GPU_HEAP_SLOTS];
 static uint64_t submitted;
 
 /* The window's layer, and the drawable the screen holds this frame. */
@@ -309,12 +312,12 @@ static int begin(void) {
 
 /* The barrier every encoder starts with: all the work queued before it. */
 static const MTLStages allstages = MTLStageVertex | MTLStageFragment | MTLStageDispatch |
-                                   MTLStageBlit;
+                                   MTLStageBlit | MTLStageAccelerationStructure;
 
 static id<MTL4ComputeCommandEncoder> open_compute(void) {
     id<MTL4ComputeCommandEncoder> e = [cmd computeCommandEncoder];
     [e barrierAfterQueueStages:allstages
-                  beforeStages:MTLStageDispatch | MTLStageBlit
+                  beforeStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure
              visibilityOptions:MTL4VisibilityOptionDevice];
     [e setArgumentTable:table];
     return e;
@@ -426,10 +429,90 @@ static int mtl_update_texture(uint32_t slot, int access, const void *data, int64
     return 1;
 }
 
-static void mtl_release(uint32_t slot, int texture) {
+/* Ray tracing (§7): acceleration structures in the heap by resource ID,
+   resident with their scratch memory, and built in a compute encoder of
+   their own. */
+static int mtl_ray_query(void) { return device && device.supportsRaytracing; }
+
+static MTL4BufferRange range_of(uint32_t slot, int64_t offset, int64_t size) {
+    return MTL4BufferRangeMake(buffers[slot].gpuAddress + (uint64_t)offset, (uint64_t)size);
+}
+
+static int mtl_accel_create(uint32_t slot, const goose_gpu_primitive_accel_desc *p,
+                            const goose_gpu_instance_accel_desc *i) {
+    MTL4AccelerationStructureDescriptor *d;
+    if (p) {
+        MTL4AccelerationStructureTriangleGeometryDescriptor *g =
+            [MTL4AccelerationStructureTriangleGeometryDescriptor new];
+        g.vertexBuffer = range_of(p->vertices, p->vertex_offset, p->vertex_count * p->vertex_stride);
+        g.vertexFormat = MTLAttributeFormatFloat3;
+        g.vertexStride = (NSUInteger)p->vertex_stride;
+        if (p->indices) {
+            g.indexBuffer = range_of(p->indices, p->index_offset, p->triangle_count * 3 * p->index_size);
+            g.indexType = p->index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        }
+        g.triangleCount = (NSUInteger)p->triangle_count;
+        g.opaque = YES;
+        MTL4PrimitiveAccelerationStructureDescriptor *pd = [MTL4PrimitiveAccelerationStructureDescriptor new];
+        pd.geometryDescriptors = @[ g ];
+        d = pd;
+    } else {
+        MTL4InstanceAccelerationStructureDescriptor *id_ = [MTL4InstanceAccelerationStructureDescriptor new];
+        id_.instanceDescriptorBuffer = range_of(i->instances, 0, i->max * GOOSE_GPU_INSTANCE_SIZE);
+        id_.instanceDescriptorStride = GOOSE_GPU_INSTANCE_SIZE;
+        id_.instanceCount = (NSUInteger)i->max;
+        id_.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeIndirect;
+        id_.instanceTransformationMatrixLayout = MTLMatrixLayoutRowMajor;
+        d = id_;
+    }
+    MTLAccelerationStructureSizes sizes = [device accelerationStructureSizesWithDescriptor:d];
+    id<MTLAccelerationStructure> as = [device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+    id<MTLBuffer> sb = [device newBufferWithLength:sizes.buildScratchBufferSize ? sizes.buildScratchBufferSize : 16
+                                           options:MTLResourceStorageModePrivate];
+    if (!as || !sb) {
+        goose_gpu_fail("Metal made no acceleration structure of %llu bytes",
+                       (unsigned long long)sizes.accelerationStructureSize);
+        return 0;
+    }
+    accels[slot] = as;
+    scratch[slot] = sb;
+    acceldescs[slot] = d;
+    ((uint64_t *)heap.contents)[slot] = as.gpuResourceID._impl;
+    [residency addAllocation:as];
+    [residency addAllocation:sb];
+    residencydirty = 1;
+    return 1;
+}
+
+static int mtl_accel_build(uint32_t slot, int64_t instances) {
+    MTL4AccelerationStructureDescriptor *d = acceldescs[slot];
+    if ([d isKindOfClass:[MTL4InstanceAccelerationStructureDescriptor class]])
+        ((MTL4InstanceAccelerationStructureDescriptor *)d).instanceCount = (NSUInteger)instances;
+    begin();
+    id<MTL4ComputeCommandEncoder> e = open_compute();
+    [e buildAccelerationStructure:accels[slot] descriptor:d
+                    scratchBuffer:MTL4BufferRangeMake(scratch[slot].gpuAddress, scratch[slot].length)];
+    [e endEncoding];
+    return 1;
+}
+
+static uint64_t mtl_accel_reference(uint32_t slot) { return accels[slot].gpuResourceID._impl; }
+
+static void mtl_release(uint32_t slot, int kind) {
     /* Released once the work submitted so far is done (§2, deferred
        destruction); this backend waits for it. */
     mtl_wait(submitted);
+    int texture = kind == GOOSE_GPU_KIND_TEXTURE;
+    if (kind == GOOSE_GPU_KIND_ACCEL) {
+        [residency removeAllocation:accels[slot]];
+        [residency removeAllocation:scratch[slot]];
+        accels[slot] = nil;
+        scratch[slot] = nil;
+        acceldescs[slot] = nil;
+        residencydirty = 1;
+        ((uint64_t *)heap.contents)[slot] = 0;
+        return;
+    }
     if (texture) {
         [residency removeAllocation:textures[slot]];
         textures[slot] = nil;
@@ -836,6 +919,7 @@ const goose_gpu_backend goose_gpu_metal = {
     "metal",
     mtl_open, mtl_close,
     mtl_buffer_create, mtl_texture_create, mtl_release, mtl_update_buffer, mtl_update_texture,
+    mtl_ray_query, mtl_accel_create, mtl_accel_build, mtl_accel_reference,
     mtl_compute_create, mtl_raster_create, mtl_pipeline_release,
     mtl_begin_compute, mtl_end_compute, mtl_begin_pass, mtl_end_pass,
     mtl_dispatch, mtl_draw, mtl_index_buffer, mtl_viewport, mtl_scissor,

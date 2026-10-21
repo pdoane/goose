@@ -22,6 +22,7 @@ windows; without SDL3 it builds with devices that have no window.
     goose test/compute.goose          a compute shader, checked against the CPU
     goose test/raster.goose           a textured quad, checked pixel by pixel
     goose test/updates.goose          updates to resources in use, in flight
+    goose test/rays.goose             inline ray queries, where the device has them
     goose examples/cube.goose         gfx's cube, in a window
 
 `GOOSE_GPU_BACKEND=vulkan` picks Vulkan over Metal on a Mac, where the

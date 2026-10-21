@@ -680,6 +680,7 @@ struct GpuEmitter {
                 { "frag_coord", GPU_FRAGMENT, "frag_coord" },
                 { "front_facing", GPU_FRAGMENT, "front_facing" },
             };
+            if (what == "trace" || what == "trace_any") return TraceX(c, sp, an, what == "trace");
             if (what == "discard") {
                 RequireStage(c, GPU_FRAGMENT, "discard()");
                 L(hlsl() ? "discard;" : "discard_fragment();");
@@ -1217,6 +1218,7 @@ struct GpuEmitter {
         auto name = cat("GsHeap", kind, "_", scalar);
         if (mslheaptypes.insert(name).second) {
             auto member = kind == "Sampler" ? string("sampler")
+                        : kind == "Accel" ? string("raytracing::instance_acceleration_structure")
                         : kind == "RWTexture2D" ? cat("texture2d<", scalar, ", access::read_write>")
                                                 : cat("texture2d<", scalar, ">");
             mslheapdefs += cat("struct ", name, " { ", member, " r; };\n");
@@ -1249,6 +1251,79 @@ struct GpuEmitter {
             Fail(c, cat(what, " exists in a ", GpuStageName(stage), " entry point only, and this "
                         "is reached from ", GpuStageName(entry->sf->gpustage), " fn ",
                         entry->sf->name));
+    }
+
+    // An inline ray query (§7), through a helper per dialect, defined on
+    // first use: the closest opaque triangle, or any.
+    int caps = 0;
+    bool raytracing = false;
+    string TraceX(Call *c, FnSpec *sp, const vector<Node *> &an, bool closest) {
+        caps |= GS_GPU_CAP_RAY_QUERY;
+        raytracing = true;
+        auto ray = TypeName(sp->argtypes[1], c->line);
+        auto f = [&](const char *n) { return FieldName(n); };
+        auto vec3 = [&](const string &x) { return msl() ? cat("float3(", x, ")") : x; };
+        auto name = closest ? "gs_trace" : "gs_trace_any";
+        if (helpers.insert(name).second) {
+            auto hit = closest ? TypeName(sp->rets[0], c->line) : string("bool");
+            string body = cat(hit, " ", name, "(", msl() ? "thread GsCtx &gs, " : "",
+                              "uint accel, ", ray, " r, uint mask) {\n");
+            if (hlsl()) {
+                body += cat("    RaytracingAccelerationStructure scene = ResourceDescriptorHeap[accel];\n"
+                            "    RayDesc d;\n    d.Origin = r.", f("origin"), ";\n    d.TMin = r.",
+                            f("t_min"), ";\n    d.Direction = r.", f("dir"), ";\n    d.TMax = r.",
+                            f("t_max"), ";\n");
+                body += closest ? "    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;\n"
+                                : "    RayQuery<RAY_FLAG_FORCE_OPAQUE | "
+                                  "RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;\n";
+                body += "    q.TraceRayInline(scene, RAY_FLAG_NONE, mask, d);\n    q.Proceed();\n";
+                if (!closest) {
+                    body += "    return q.CommittedStatus() != COMMITTED_NOTHING;\n}\n\n";
+                } else {
+                    body += cat("    ", hit, " h = (", hit, ")0;\n"
+                                "    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {\n"
+                                "        h.", f("kind"), " = 1u;\n"
+                                "        h.", f("t"), " = q.CommittedRayT();\n"
+                                "        h.", f("instance"), " = q.CommittedInstanceIndex();\n"
+                                "        h.", f("id"), " = q.CommittedInstanceID();\n"
+                                "        h.", f("primitive"), " = q.CommittedPrimitiveIndex();\n"
+                                "        h.", f("front_face"), " = q.CommittedTriangleFrontFace() ? 1u : 0u;\n"
+                                "        h.", f("barycentrics"), " = q.CommittedTriangleBarycentrics();\n"
+                                "    }\n    return h;\n}\n\n");
+                }
+            } else {
+                auto heap = MslHeapType("Accel", "scene");
+                body += cat("    raytracing::ray rr(", vec3(cat("r.", f("origin"))), ", ",
+                            vec3(cat("r.", f("dir"))), ", r.", f("t_min"), ", r.", f("t_max"),
+                            ");\n"
+                            "    raytracing::intersector<raytracing::triangle_data, "
+                            "raytracing::instancing> i;\n"
+                            "    i.assume_geometry_type(raytracing::geometry_type::triangle);\n"
+                            "    i.force_opacity(raytracing::forced_opacity::opaque);\n");
+                if (!closest) body += "    i.accept_any_intersection(true);\n";
+                body += cat("    auto res = i.intersect(rr, reinterpret_cast<device const ", heap,
+                            " *>(gs.heap)[accel].r, mask);\n");
+                if (!closest) {
+                    body += "    return res.type != raytracing::intersection_type::none;\n}\n\n";
+                } else {
+                    body += cat("    ", hit, " h{};\n"
+                                "    if (res.type == raytracing::intersection_type::triangle) {\n"
+                                "        h.", f("kind"), " = 1u;\n"
+                                "        h.", f("t"), " = res.distance;\n"
+                                "        h.", f("instance"), " = res.instance_id;\n"
+                                "        h.", f("id"), " = res.user_instance_id;\n"
+                                "        h.", f("primitive"), " = res.primitive_id;\n"
+                                "        h.", f("front_face"), " = res.triangle_front_facing ? 1u : 0u;\n"
+                                "        h.", f("barycentrics"), " = res.triangle_barycentric_coord;\n"
+                                "    }\n    return h;\n}\n\n");
+                }
+            }
+            helperdefs += body;
+        }
+        auto accel = X(an[0]);
+        auto r = X(an[1]);
+        auto mask = X(an[2]);
+        return cat(name, "(", msl() ? "gs, " : "", "(", accel, ").index, ", r, ", ", mask, ")");
     }
 
     // A texture builtin (stdlib/gpu_shader.goose): the coordinate of the
@@ -1415,7 +1490,9 @@ struct GpuEmitter {
                        stage == GPU_FRAGMENT && entry->rets.size() == 1 ? " : SV_Target0" : "",
                        " {\n", setup, st.out, "}\n");
         } else {
-            out += "#include <metal_stdlib>\nusing namespace metal;\n\n";
+            out += raytracing ? "#include <metal_stdlib>\n#include <metal_raytracing>\n"
+                                "using namespace metal;\n\n"
+                              : "#include <metal_stdlib>\nusing namespace metal;\n\n";
             out += structdefs;
             out += iface;
             out += mslheapdefs;
@@ -1560,6 +1637,7 @@ struct GpuCompiled {
     string name;
     string codes[GS_GPU_FORMAT_COUNT];
     int64_t pushsize = 0, uniformsize = 0;
+    uint32_t caps = 0;
 };
 
 // The library of a pipeline's entry points (src/gpu_library.h).
@@ -1572,6 +1650,7 @@ inline string GpuLibrary(const vector<GpuCompiled> &entries) {
     for (auto &e : entries) {
         h.push_size = max(h.push_size, (uint32_t)e.pushsize);
         h.uniform_size = max(h.uniform_size, (uint32_t)e.uniformsize);
+        h.caps |= e.caps;
         if (e.entry->sf->gpustage == GPU_FRAGMENT) h.color_outputs = (uint32_t)e.entry->rets.size();
     }
     auto headsize = sizeof h + entries.size() * sizeof(gs_gpu_lib_entry);
@@ -1666,6 +1745,7 @@ inline void CompileGpuEntries(Ast &ast, const GpuCompileOptions &opts) {
                 }
                 current = nullptr;
                 out.pushsize = dxil.pushsize;
+                out.caps = (uint32_t)dxil.caps;
                 out.uniformsize = dxil.uniformsize;
                 if (!opts.emitdir.empty()) {
                     WriteFileMakingDirs(cat(opts.emitdir, "/", out.name, ".dxil.hlsl"), texts[0]);

@@ -730,11 +730,14 @@ command-buffer work like any other, ordered by barriers. A top-level
 structure is a heap handle (`gpu::Accel`), so a shader reaches it like a
 texture, through push constants or a buffer.
 
-`gpu::Instance` is one portable record (a `float3x4` transform, a 24-bit id,
-an 8-bit mask, flags and the primitive structure's handle) in the layout
-Direct3D 12 and Vulkan share. Instances are GPU data: a culling compute pass
-writes them as readily as the host does. The Metal backend converts them
-to Metal's own descriptor with a compute pass it records ahead of the build.
+`gpu::Instance` is one portable record: a row-major 3x4 transform, then
+options, a mask, an intersection table offset (unused), a user id and the
+primitive structure's reference (`gpu::reference`), 72 bytes. That is
+Metal's indirect instance descriptor read with a row-major transform, which
+Metal 4 builds from directly; Direct3D 12 and Vulkan have a 64-byte record
+of their own, which their backends convert with a compute pass recorded
+ahead of the build. Instances are GPU data: a culling compute pass writes
+them as readily as the host does.
 
 On the GPU:
 
@@ -840,6 +843,17 @@ Each phase lands as working commits with its tests.
 4. **Ray tracing**, on Metal and Direct3D 12: acceleration structures, the
    instance conversion pass, `trace` and `trace_any`. A small path tracer
    is the test, with an offline reference renderer for its images.
+
+   *Where it stands:* built on Metal 4. `gpu::trace` and `gpu::trace_any`
+   emit inline `RayQuery` in HLSL (compiled to DXIL and SPIR-V) and an
+   `intersector` in MSL, and mark the library as needing ray queries,
+   which a device without them refuses to make a pipeline from. The
+   package builds primitive and instance acceleration structures, in
+   order with the work around them. `packages/gpu/test/rays.goose` casts
+   64 rays at three instances of one square and checks every hit's
+   instance, distance, triangle and side, on Metal under validation.
+   KosmicKrisp has no ray queries yet, so Vulkan reports none; its build
+   path and the instance conversion wait for a driver that has them.
 5. **A frame graph, written in Goose**: passes that declare what they read
    and write, barriers and transient memory derived from that, unused passes
    pruned. Whether Goose's provenance analysis can reject a stale resource

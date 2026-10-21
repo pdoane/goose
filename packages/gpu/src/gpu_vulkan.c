@@ -1013,7 +1013,21 @@ static int vk_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, con
     return vk_update_texture_at(slot, GOOSE_GPU_ACCESS_NONE, data, len);
 }
 
-static void vk_release(uint32_t slot, int texture) {
+/* KosmicKrisp has no ray queries yet; VK_KHR_ray_query comes with a device
+   that does (docs/design/gpu.md §7). */
+static int vk_ray_query(void) { return 0; }
+static int vk_accel_create(uint32_t slot, const goose_gpu_primitive_accel_desc *p,
+                           const goose_gpu_instance_accel_desc *i) {
+    (void)slot; (void)p; (void)i;
+    goose_gpu_fail("Vulkan ray queries are not implemented");
+    return 0;
+}
+static int vk_accel_build(uint32_t slot, int64_t n) { (void)slot; (void)n; return 0; }
+static uint64_t vk_accel_reference(uint32_t slot) { (void)slot; return 0; }
+
+static void vk_release(uint32_t slot, int kind) {
+    int texture = kind == GOOSE_GPU_KIND_TEXTURE;
+    if (kind == GOOSE_GPU_KIND_ACCEL) return;
     /* Released once the work submitted so far is done (§2, deferred
        destruction); this backend waits for it. */
     vkDeviceWaitIdle(device);
@@ -1455,6 +1469,7 @@ const goose_gpu_backend goose_gpu_vulkan = {
     "vulkan",
     vk_open, vk_close,
     vk_buffer_create, vk_texture_create, vk_release, vk_update_buffer, vk_update_texture,
+    vk_ray_query, vk_accel_create, vk_accel_build, vk_accel_reference,
     vk_compute_create, vk_raster_create, vk_pipeline_release,
     vk_begin_compute, vk_end_compute, vk_begin_pass, vk_end_pass,
     vk_dispatch, vk_draw, vk_index_buffer, vk_viewport, vk_scissor,

@@ -147,6 +147,11 @@ extern "goose_gpu_draw_indexed" fn draw_indexed(indices: i64, instances: i64, fi
                                                 vertex_offset: i64, first_instance: i64);
 extern "goose_gpu_dispatch" fn dispatch(x: i64, y: i64, z: i64);
 extern "goose_gpu_barrier" fn barrier_native(index: u32, before: i64, after: i64);
+extern "goose_gpu_ray_query" fn ray_query() -> bool;
+extern "goose_gpu_primitive_accel" fn primitive_accel_native(desc: PrimitiveAccelDesc) -> u32;
+extern "goose_gpu_instance_accel" fn instance_accel_native(desc: InstanceAccelDesc) -> u32;
+extern "goose_gpu_build" fn build_native(index: u32, instances: i64);
+extern "goose_gpu_accel_reference" fn reference_native(index: u32) -> u64;
 extern "goose_gpu_submit" fn submit() -> u64;
 extern "goose_gpu_fence_done" fn fence_done(f: u64) -> bool;
 extern "goose_gpu_wait" fn wait(f: u64);
@@ -305,6 +310,58 @@ fn draw_indexed_instanced(indices: i64, instances: i64) { draw_indexed(indices, 
 // `after`, and t's layout changed to suit: between passes, never in one.
 fn barrier(t: Texture, before: i64, after: i64) { barrier_native(t.index, before, after); }
 fn barrier(b: Buffer, before: i64, after: i64) { barrier_native(b.index, before, after); }
+
+// Ray tracing (docs/design/gpu.md §7), where ray_query() says the device has
+// it. A primitive acceleration structure holds triangles, positions
+// float3s `vertex_stride` bytes apart, indexed or not; an instance one holds
+// up to `max` gpu::Instance records from a buffer, which the host or a
+// shader writes. Each is built when build() says, in order with the work
+// around it; a shader reaches an instance one as a gpu::Accel, through push
+// constants or a buffer, and traces it with gpu::trace.
+struct PrimitiveAccelDesc {
+    vertices: Buffer,
+    vertex_offset: i64 = 0,
+    vertex_stride: i64 = 12,
+    vertex_count: i64,
+    indices: Buffer = Buffer { 0 },
+    index_size: i64 = 4,
+    index_offset: i64 = 0,
+    triangle_count: i64,
+}
+
+struct InstanceAccelDesc { instances: Buffer, max: i64 }
+
+let INSTANCE_CULL_DISABLE: u32 = 1;
+let INSTANCE_FRONT_COUNTERCLOCKWISE: u32 = 2;
+let INSTANCE_OPAQUE: u32 = 4;
+
+// One instance: a primitive structure, where the transform's rows put it,
+// the id gpu::Hit reports, and the mask a ray's must share a bit with.
+struct Instance {
+    row0: float4,
+    row1: float4,
+    row2: float4,
+    flags: u32 = 4,         // INSTANCE_OPAQUE
+    mask: u32 = 255,
+    table: u32 = 0,
+    id: u32 = 0,
+    accel: u64,             // reference(the primitive structure)
+}
+
+fn primitive_accel(desc: PrimitiveAccelDesc) -> Accel { Accel { primitive_accel_native(desc) } }
+fn instance_accel(desc: InstanceAccelDesc) -> Accel { Accel { instance_accel_native(desc) } }
+fn build(a: Accel) { build_native(a.index, 0); }
+fn build(a: Accel, instances: i64) { build_native(a.index, instances); }
+fn reference(a: Accel) -> u64 { reference_native(a.index) }
+fn release(a: Accel) { release_native(a.index); }
+
+// An instance of `a` placed by m, the 3x4 rows of the column-major mat4.
+fn instance(m: mat4, a: Accel, id: u32) -> Instance {
+    Instance { row0: float4 { m.c0.x, m.c1.x, m.c2.x, m.c3.x },
+               row1: float4 { m.c0.y, m.c1.y, m.c2.y, m.c3.y },
+               row2: float4 { m.c0.z, m.c1.z, m.c2.z, m.c3.z },
+               id: id, accel: reference(a), .. }
+}
 
 // A copy of `size` bytes of b from `offset`, or of all of t's mip 0, taken
 // in order with the work recorded around it, and ready once the submission
