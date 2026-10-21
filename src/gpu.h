@@ -177,6 +177,8 @@ struct GpuEmitter {
             return cat(e, w);
         }
         if (t->kind == TY_STRUCT) return StructName(t, l);
+        if (t->kind == TY_ENUM) return AdtName(t, l);
+        if (t->kind == TY_VARIANT) return VariantName(t, l);
         if (FixedArray(t)) return ArrayName(t, l);
         if (t->kind == TY_ARRAY)
             Fail(l, cat("only fixed arrays run on the GPU, T[k], not ", TypeStr(t)));
@@ -215,6 +217,14 @@ struct GpuEmitter {
         if (IsScalar(t)) return 4;
         if (auto w = VecWidth(t)) return PackedSize(VecElem(t), l) * w;
         if (auto a = FixedArray(t)) return PackedSize(a->sub, l) * a->size;
+        if (t->kind == TY_ENUM) {
+            auto ei = EInst(t, l);
+            return TagSize(ei) + 4 * AdtWords(ei, l);
+        }
+        if (t->kind == TY_VARIANT) {
+            auto ei = EInst(t->var->adt, l);
+            return PayloadSize(ei, ei->en->VariantIndex(t->var->variant), l);
+        }
         if (t->kind == TY_STRUCT) {
             auto si = Inst(t, l);
             int64_t size = 0;
@@ -269,6 +279,255 @@ struct GpuEmitter {
         if (body.empty()) body = "    uint gs_empty;\n";
         structdefs += cat("struct ", name, " {\n", body, "};\n\n");
         return name;
+    }
+
+    // ------------------------------------------------------------------
+    // ADTs (design/gpu_language.md §5). A fixed-mode ADT is its tag and its
+    // payload as 32-bit words, at the payload's packed offsets, which every
+    // field the GPU computes with fills whole; a variant type is a struct of
+    // its fields. In a buffer an ADT is as Goose packs it, the tag's byte or
+    // two and then the payload, which a load reads word by word (ReadX).
+
+    EnumInst *EInst(TypeExpr *t, Line l) {
+        if (t->kind != TY_ENUM) Fail(l, cat("internal: not an ADT: ", TypeStr(t)));
+        if (t->enu->varmode)
+            Fail(l, cat("variable-mode ADTs do not run on the GPU yet (design/gpu_language.md "
+                        "§8): ", TypeStr(t)));
+        if (!t->enu->inst) Fail(l, cat("internal: no instance for ", TypeStr(t)));
+        return t->enu->inst;
+    }
+
+    static int64_t TagSize(EnumInst *ei) { return ei->en->variants.size() <= 256 ? 1 : 2; }
+
+    // A variant's payload fields, as leaves at their packed offsets: each
+    // a 32-bit number, starting a word.
+    auto PayloadLeaves(EnumInst *ei, int vi, Line l) {
+        vector<Leaf> out;
+        int64_t off = 0;
+        auto &fields = ei->en->variants[vi].fields;
+        for (size_t i = 0; i < fields.size(); i++) {
+            auto &f = fields[i];
+            if (f.ispad) {
+                off += f.padsize >= 0 ? f.padsize : (4 - off % 4) % 4;
+                continue;
+            }
+            auto ft = ei->vftypes[vi][i];
+            if (ft->kind == TY_ENUM)
+                Fail(f.line, "an ADT inside an ADT's payload does not run on the GPU yet");
+            Leaves(ft, cat(".", FieldName(f.name)), off, out, f.line);
+            off += PackedSize(ft, f.line);
+        }
+        for (auto &lf : out)
+            if (lf.type->kind == TY_BOOL || lf.off % 4)
+                Fail(l, cat("variant ", ei->en->variants[vi].name, " holds a field the GPU cannot "
+                            "store in a word: ", lf.path));
+        return out;
+    }
+
+    int64_t PayloadSize(EnumInst *ei, int vi, Line) {
+        int64_t off = 0;
+        auto &fields = ei->en->variants[vi].fields;
+        for (size_t i = 0; i < fields.size(); i++) {
+            auto &f = fields[i];
+            if (f.ispad) off += f.padsize >= 0 ? f.padsize : (4 - off % 4) % 4;
+            else off += PackedSize(ei->vftypes[vi][i], f.line);
+        }
+        return off;
+    }
+
+    int64_t AdtWords(EnumInst *ei, Line l) {
+        int64_t n = 1;
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+            n = max(n, (PayloadSize(ei, (int)vi, l) + 3) / 4);
+        return n;
+    }
+
+    unordered_map<EnumInst *, string> adtnames;
+    string AdtName(TypeExpr *t, Line l) {
+        auto ei = EInst(t, l);
+        if (auto it = adtnames.find(ei); it != adtnames.end()) return it->second;
+        string base = string(ei->en->qname);
+        for (auto &c : base) if (c == ':') c = '_';
+        while (base.find("__") != string::npos) base.replace(base.find("__"), 2, "_");
+        for (auto a : ei->args) base += "_" + Mangle(a);
+        auto name = FreshGlobal(base);
+        adtnames[ei] = name;
+        auto n = AdtWords(ei, l);
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++) PayloadLeaves(ei, (int)vi, l);
+        structdefs += cat("struct ", name, " {\n    uint tag;\n    uint w[", n, "];\n};\n\n");
+        return name;
+    }
+
+    string VariantName(TypeExpr *t, Line l) {
+        auto ei = EInst(t->var->adt, l);
+        AdtName(t->var->adt, l);
+        return VariantTypeName(ei, ei->en->VariantIndex(t->var->variant), l);
+    }
+
+    // The struct of variant `vi`'s fields, its ADT's name declared first.
+    map<pair<EnumInst *, int>, string> variantnames;
+    string VariantTypeName(EnumInst *ei, int vi, Line l) {
+        if (auto it = variantnames.find({ ei, vi }); it != variantnames.end()) return it->second;
+        if (!adtnames.count(ei)) Fail(l, "internal: a variant of an ADT not yet named");
+        auto name = FreshGlobal(cat(adtnames[ei], "_", ei->en->variants[vi].name));
+        variantnames[{ ei, vi }] = name;
+        string body;
+        int pads = 0;
+        auto &fields = ei->en->variants[vi].fields;
+        for (size_t i = 0; i < fields.size(); i++) {
+            auto &f = fields[i];
+            if (f.ispad) {
+                auto n = f.padsize >= 0 ? f.padsize : 0;
+                if (n) body += cat("    uint gs_pad", pads++, "[", n / 4, "];\n");
+                continue;
+            }
+            body += cat("    ", TypeName(ei->vftypes[vi][i], f.line, true), " ", FieldName(f.name), ";\n");
+        }
+        if (body.empty()) body = "    uint gs_empty;\n";
+        structdefs += cat("struct ", name, " {\n", body, "};\n\n");
+        return name;
+    }
+
+    // A word holding a number's bits, and the number back.
+    string ToWord(const string &x, TypeExpr *t, Line l) {
+        auto sn = ScalarName(t, l);
+        if (sn == "uint") return x;
+        if (sn == "int") return cat("((uint)(", x, "))");
+        return hlsl() ? cat("asuint(", x, ")") : cat("as_type<uint>(", x, ")");
+    }
+
+    string FromWord(const string &w, TypeExpr *t, Line l) {
+        auto sn = ScalarName(t, l);
+        if (sn == "uint") return w;
+        if (sn == "int") return cat("((int)(", w, "))");
+        return hlsl() ? cat("asfloat(", w, ")") : cat("as_type<float>(", w, ")");
+    }
+
+    // The ADT holding variant `vi` with payload `v`, a variant struct's
+    // value ("" for a variant without one).
+    string PackVariant(TypeExpr *adt, int vi, const string &v, Line l) {
+        auto ei = EInst(adt, l);
+        auto tn = AdtName(adt, l);
+        auto t = Temp();
+        L(cat(tn, " ", t, ";"));
+        L(cat(t, ".tag = ", vi, "u;"));
+        for (int64_t k = 0; k < AdtWords(ei, l); k++) L(cat(t, ".w[", k, "] = 0u;"));
+        if (!v.empty()) {
+            auto src = v;
+            if (!Simple(v)) {
+                src = Temp();
+                L(cat(VariantTypeName(ei, vi, l), " ", src, " = ", v, ";"));
+            }
+            for (auto &lf : PayloadLeaves(ei, vi, l))
+                L(cat(t, ".w[", lf.off / 4, "] = ", ToWord(src + lf.path, lf.type, l), ";"));
+        }
+        return t;
+    }
+
+    // Variant `vi`'s payload out of the ADT value `a`.
+    string UnpackVariant(EnumInst *ei, int vi, const string &a, Line l) {
+        auto t = Temp();
+        L(cat(VariantTypeName(ei, vi, l), " ", t, ";"));
+        int pads = 0;
+        for (auto &f : ei->en->variants[vi].fields) {
+            if (!f.ispad) continue;
+            auto n = f.padsize >= 0 ? f.padsize : 0;
+            for (int64_t w = 0; w < n / 4; w++) L(cat(t, ".gs_pad", pads, "[", w, "] = 0u;"));
+            if (n) pads++;
+        }
+        for (auto &lf : PayloadLeaves(ei, vi, l))
+            L(cat(t, lf.path, " = ", FromWord(cat(a, ".w[", lf.off / 4, "]"), lf.type, l), ";"));
+        return t;
+    }
+
+    static bool Simple(const string &x) {
+        for (auto c : x) if (!isalnum((unsigned char)c) && c != '_') return false;
+        return !x.empty();
+    }
+
+    // Whether a type holds an ADT anywhere, which a buffer holds as Goose
+    // packs it, the payload after the tag's bytes.
+    bool HasAdt(TypeExpr *t) {
+        if (t->kind == TY_ENUM) return true;
+        if (auto a = FixedArray(t)) return HasAdt(a->sub);
+        if (t->kind == TY_STRUCT && !VecWidth(t)) {
+            auto si = t->struc->inst;
+            if (!si) return false;
+            for (size_t i = 0; i < si->st->fields.size(); i++)
+                if (!si->st->fields[i].ispad && HasAdt(si->ftypes[i])) return true;
+        }
+        return false;
+    }
+
+    // Element `i` of the buffer at heap index `index`, of a type holding an
+    // ADT, read field by field at its packed offsets, each word put
+    // together from the two aligned ones around it (design/gpu_language.md
+    // §5): a function per type.
+    unordered_map<string, string> readers;
+    string ReadX(const string &index, const string &i, TypeExpr *t, Line l) {
+        auto tn = TypeName(t, l);
+        if (!helpers.count("gs_word")) {
+            helpers.insert("gs_word");
+            helperdefs += hlsl()
+                ? "uint gs_word(ByteAddressBuffer b, uint at) {\n"
+                  "    uint s = (at & 3u) * 8u;\n    uint lo = b.Load(at & ~3u);\n"
+                  "    if (s == 0u) return lo;\n    return (lo >> s) | (b.Load((at & ~3u) + 4u) << (32u - s));\n}\n\n"
+                : "uint gs_word(device const uint *b, uint at) {\n"
+                  "    uint s = (at & 3u) * 8u;\n    uint lo = b[at >> 2];\n"
+                  "    if (s == 0u) return lo;\n    return (lo >> s) | (b[(at >> 2) + 1u] << (32u - s));\n}\n\n";
+        }
+        auto it = readers.find(tn);
+        if (it == readers.end()) {
+            auto name = FreshGlobal(cat("gs_read_", tn));
+            it = readers.emplace(tn, name).first;
+            string body;
+            if (hlsl()) body = cat(tn, " ", name, "(uint index, uint at) {\n    ByteAddressBuffer b = "
+                                   "ResourceDescriptorHeap[index];\n    ", tn, " r;\n");
+            else body = cat(tn, " ", name, "(thread GsCtx &gs, uint index, uint at) {\n    device const uint *b = "
+                            "reinterpret_cast<device const uint *>(gs.heap[index]);\n    ", tn, " r;\n");
+            ReadFields(t, "r", "at", 0, body, l);
+            body += "    return r;\n}\n\n";
+            helperdefs += body;
+        }
+        auto stride = PackedSize(t, l);
+        return cat(it->second, "(", msl() ? "gs, " : "", index, ", (", i, ") * ", stride, "u)");
+    }
+
+    void ReadFields(TypeExpr *t, const string &path, const string &at, int64_t off, string &body, Line l) {
+        auto word = [&](int64_t o) { return cat("gs_word(b, ", at, " + ", o, "u)"); };
+        if (IsScalar(t)) {
+            body += cat("    ", path, " = ", FromWord(word(off), t, l), ";\n");
+            return;
+        }
+        if (auto w = VecWidth(t)) {
+            static const char *comp[] = { ".x", ".y", ".z", ".w" };
+            for (int k = 0; k < w; k++)
+                body += cat("    ", path, comp[k], " = ", FromWord(word(off + 4 * k), VecElem(t), l), ";\n");
+            return;
+        }
+        if (auto a = FixedArray(t)) {
+            auto es = PackedSize(a->sub, l);
+            for (int64_t k = 0; k < a->size; k++) ReadFields(a->sub, cat(path, ".v[", k, "]"), at, off + k * es, body, l);
+            return;
+        }
+        if (t->kind == TY_ENUM) {
+            auto ei = EInst(t, l);
+            auto ts = TagSize(ei);
+            body += cat("    ", path, ".tag = ", word(off), " & ", ts == 1 ? "0xffu" : "0xffffu", ";\n");
+            for (int64_t k = 0; k < AdtWords(ei, l); k++)
+                body += cat("    ", path, ".w[", k, "] = ", word(off + ts + 4 * k), ";\n");
+            return;
+        }
+        auto si = Inst(t, l);
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            auto &f = si->st->fields[i];
+            if (f.ispad) {
+                off += f.padsize >= 0 ? f.padsize : (4 - off % 4) % 4;
+                continue;
+            }
+            ReadFields(si->ftypes[i], cat(path, ".", FieldName(f.name)), at, off, body, f.line);
+            off += PackedSize(si->ftypes[i], f.line);
+        }
     }
 
     // Several results, as one struct of them, r0, r1, ...: one per list of
@@ -498,6 +757,11 @@ struct GpuEmitter {
     // `x` of type `from` where type `to` is wanted: scalars convert where
     // the checker adapted a value it did not cast.
     string Convert(const string &x, TypeExpr *from, TypeExpr *to, Line l) {
+        if (from && from->kind == TY_REF) from = from->ref->sub;
+        if (from && to && from->kind == TY_VARIANT && to->kind == TY_ENUM) {
+            auto ei = EInst(to, l);
+            return PackVariant(to, ei->en->VariantIndex(from->var->variant), x, l);
+        }
         if (!from || !to || !IsScalar(from) || !IsScalar(to)) return x;
         auto a = ScalarName(from, l), b = ScalarName(to, l);
         return a == b ? x : cat("((", b, ")(", x, "))");
@@ -553,7 +817,16 @@ struct GpuEmitter {
             case NK_StrLit: Fail(n, "strings do not run on the GPU");
             case NK_NullLit: Fail(n, "optionals do not run on the GPU");
             case NK_SliceExpr: Fail(n, "slices do not run on the GPU");
-            case NK_MatchExpr: Fail(n, "match does not run on the GPU yet");
+            case NK_MatchExpr: {
+                if (n->exprtype->kind == TY_VOID) {
+                    MatchInto((MatchExpr *)n, "");
+                    return "";
+                }
+                auto t = Temp();
+                L(cat(TypeName(n->exprtype, n->line), " ", t, ";"));
+                MatchInto((MatchExpr *)n, t);
+                return t;
+            }
             case NK_EarlyBlock: Fail(n, "`block` does not run on the GPU yet");
             case NK_FunVal: Fail(n, "function values do not run on the GPU yet");
             default: Fail(n, "this construct does not run on the GPU (docs/design/gpu.md §5.2)");
@@ -872,6 +1145,8 @@ struct GpuEmitter {
         auto shift = b->op == T_SHL || b->op == T_SHR;
         auto r = shift ? ShiftCount(b->right) : X(b->right);
         auto lw = VecWidth(lt), rw = VecWidth(rt);
+        if (lt->kind == TY_ENUM || rt->kind == TY_ENUM)
+            Fail(b, "comparing ADTs does not run on the GPU yet: match on them");
         if ((lt->kind == TY_STRUCT && !lw) || (rt->kind == TY_STRUCT && !rw))
             Fail(b, "elementwise arithmetic runs on the GPU on vectors only, not other structs");
         auto vec = lw || rw;
@@ -915,7 +1190,20 @@ struct GpuEmitter {
     }
 
     string DotX(Dot *d) {
-        if (d->variantconst) Fail(d, "enums do not run on the GPU yet");
+        if (d->variantconst) {
+            // A variant without a payload: its tag alone.
+            auto ei = d->einst;
+            auto vi = ei->en->VariantIndex(d->variantconst);
+            auto t = d->exprtype;
+            if (t->kind == TY_VARIANT) {
+                auto v = Temp();
+                AdtName(t->var->adt, d->line);
+                L(cat(VariantTypeName(ei, vi, d->line), " ", v, ";"));
+                L(cat(v, ".gs_empty = 0u;"));
+                return v;
+            }
+            return PackVariant(t, vi, "", d->line);
+        }
         if (d->member == B_LEN) {
             if (auto a = FixedArray(ArrayType(d->obj))) return LenText(a->size, d->exprtype, d->line);
         }
@@ -924,7 +1212,7 @@ struct GpuEmitter {
         if (ot->kind == TY_REF) ot = ot->ref->sub;
         auto o = X(d->obj);
         if (VecWidth(ot)) return cat(o, ".", d->name);
-        if (ot->kind != TY_STRUCT) Fail(d, "internal: field of a non-struct");
+        if (ot->kind != TY_STRUCT && ot->kind != TY_VARIANT) Fail(d, "internal: field of a non-struct");
         auto x = cat(o, ".", FieldName(d->name));
         // A struct's vector fields are packed in MSL (TypeName).
         if (msl() && VecWidth(d->exprtype)) return cat(TypeName(d->exprtype, d->line), "(", x, ")");
@@ -971,8 +1259,44 @@ struct GpuEmitter {
         return tv;
     }
 
+    // `Shape.Circle { r: 1.0 }`: the variant's struct, packed into its ADT
+    // where the literal's type is the ADT.
+    string VariantLitX(StructLit *s) {
+        auto ei = s->einst;
+        auto vi = ei->en->VariantIndex(s->variant);
+        auto t = s->exprtype;
+        auto adt = t->kind == TY_VARIANT ? t->var->adt : t;
+        AdtName(adt, s->line);
+        auto &fields = ei->en->variants[vi].fields;
+        vector<string> vals(fields.size());
+        for (size_t i = 0; i < fields.size(); i++) {
+            if (fields[i].ispad) continue;
+            auto init = s->InitFor((int)i);
+            if (!init) Fail(s, "internal: a variant literal without a field's value");
+            vals[i] = Convert(X(init), init->exprtype, ei->vftypes[vi][i], init->line);
+        }
+        auto v = Temp();
+        L(cat(VariantTypeName(ei, (int)vi, s->line), " ", v, ";"));
+        int pads = 0;
+        bool any = false;
+        for (size_t i = 0; i < fields.size(); i++) {
+            auto &f = fields[i];
+            if (f.ispad) {
+                auto n = f.padsize >= 0 ? f.padsize : 0;
+                for (int64_t w = 0; w < n / 4; w++) L(cat(v, ".gs_pad", pads, "[", w, "] = 0u;"));
+                if (n) pads++;
+                continue;
+            }
+            L(cat(v, ".", FieldName(f.name), " = ", vals[i], ";"));
+            any = true;
+        }
+        if (!any) L(cat(v, ".gs_empty = 0u;"));
+        if (t->kind == TY_VARIANT) return v;
+        return PackVariant(adt, (int)vi, any ? v : "", s->line);
+    }
+
     string StructLitX(StructLit *s) {
-        if (s->einst || s->variant) Fail(s, "enums do not run on the GPU yet");
+        if (s->einst || s->variant) return VariantLitX(s);
         auto t = s->exprtype;
         auto tn = TypeName(t, s->line);
         auto si = Inst(t, s->line);
@@ -1032,7 +1356,7 @@ struct GpuEmitter {
 
     string CallX(Call *c) {
         if (c->fvbody || c->trailing) Fail(c, "function values do not run on the GPU yet");
-        if (!c->dispatch.empty()) Fail(c, "case functions do not run on the GPU yet");
+        if (!c->dispatch.empty()) return DispatchX(c);
         auto an = c->ArgNodes();
         if (c->builtin >= 0) {
             switch (c->builtin) {
@@ -1040,12 +1364,17 @@ struct GpuEmitter {
                     auto et = c->rettypes[0];
                     auto index = X(an[0]);
                     auto i = X(an[1]);
+                    if (HasAdt(et)) return ReadX(index, i, et, c->line);
                     auto [e, off] = BufferElem(index, i, et, c->line, false);
                     if (msl()) return VecWidth(et) ? cat(TypeName(et, c->line), "(", e, ")") : e;
                     return cat(e, ".Load<", TypeName(et, c->line), ">(", off, ")");
                 }
                 case B_GPU_STORE: {
                     auto et = an[2]->exprtype;
+                    if (HasAdt(et))
+                        Fail(c, "storing an ADT into a buffer does not run on the GPU yet: Goose packs "
+                                "its payload after the tag's byte, and a GPU writes whole words, which "
+                                "neighbouring elements would share (design/gpu_language.md §5)");
                     auto index = X(an[0]);
                     auto i = X(an[1]);
                     auto v = X(an[2]);
@@ -1258,6 +1587,116 @@ struct GpuEmitter {
         Fail(c, cat("extern fn ", sp->sf->name, " runs on the CPU only"));
     }
 
+    // `match`: tests in order, the tag's for an ADT and the value's ranges
+    // for an integer, as an if-chain rather than a switch, where a Goose
+    // `break` in an arm would end the switch instead of its loop. An arm's
+    // payload binder is the variant unpacked. With `dst`, each arm's value
+    // goes there.
+    void MatchInto(MatchExpr *m, const string &dst) {
+        auto st = m->scrutinee->exprtype;
+        if (st->kind == TY_REF) st = st->ref->sub;
+        auto adt = st->kind == TY_ENUM;
+        if (!adt && st->kind != TY_INT) Fail(m, cat("match on ", TypeStr(st), " does not run on the GPU"));
+        auto v = Temp();
+        L(cat("const ", TypeName(st, m->line), " ", v, " = ", X(m->scrutinee), ";"));
+        EnumInst *ei = adt ? EInst(st, m->line) : nullptr;
+        // The arms that can be taken, the last of an ADT's taken unconditionally
+        // when the arms cover every variant.
+        vector<MatchArm *> arms;
+        for (auto &a : m->arms) if (a.body) arms.push_back(&a);
+        bool first = true;
+        for (size_t k = 0; k < arms.size(); k++) {
+            auto &arm = *arms[k];
+            string cond;
+            if (arm.pat.kind != P_WILDCARD && !(adt && k + 1 == arms.size())) {
+                if (adt) {
+                    for (auto sv : arm.variants)
+                        cond += cat(cond.empty() ? "" : " || ", v, ".tag == ", ei->en->VariantIndex(sv), "u");
+                } else {
+                    for (auto &r : arm.ranges) {
+                        auto lo = IntText(r.lo, st, m->line), hi = IntText(r.hi, st, m->line);
+                        cond += cat(cond.empty() ? "" : " || ",
+                                    r.lo == r.hi ? cat(v, " == ", lo) : cat("(", v, " >= ", lo, " && ", v, " <= ", hi, ")"));
+                    }
+                }
+            }
+            if (cond.empty()) L(first ? "{" : "} else {");
+            else L(cat(first ? "if (" : "} else if (", cond, ") {"));
+            first = false;
+            fs->ind++;
+            if (arm.binder) {
+                if (arm.pat.byref) Fail(m, "a payload bound by reference needs a variable-mode ADT, "
+                                           "which does not run on the GPU yet");
+                auto vi = ei->en->VariantIndex(arm.variants[0]);
+                fs->locals[arm.binder] = UnpackVariant(ei, vi, v, m->line);
+            }
+            if (dst.empty()) Stmt(arm.body);
+            else Into(arm.body, dst);
+            fs->ind--;
+            if (cond.empty()) break;
+        }
+        if (!first) L("}");
+    }
+
+    // A call of case functions (spec §8.2): its arguments evaluated once,
+    // then the tag of the dispatching one choosing the overload, which
+    // takes the variant's payload.
+    string DispatchX(Call *c) {
+        auto an = c->ArgNodes();
+        auto k = c->dispatcharg;
+        auto at = an[k]->exprtype;
+        if (at->kind == TY_REF) at = at->ref->sub;
+        auto ei = EInst(at, c->line);
+        FnSpec *any = nullptr;
+        for (auto sp : c->dispatch) if (sp) any = sp;
+        if (!any) Fail(c, "internal: a dispatch without overloads");
+        vector<string> vals;
+        for (size_t i = 0; i < an.size(); i++) {
+            auto pt = i < any->argtypes.size() ? any->argtypes[i] : nullptr;
+            if (pt && WritableRef(pt))
+                Fail(an[i], "a case function taking a reference it writes does not run on the GPU yet");
+            auto x = X(an[i]);
+            auto t = Temp();
+            auto ty = an[i]->exprtype->kind == TY_REF ? an[i]->exprtype->ref->sub : an[i]->exprtype;
+            L(cat("const ", TypeName(ty, an[i]->line), " ", t, " = ", x, ";"));
+            vals.push_back(t);
+        }
+        string res;
+        if (!any->rets.empty()) {
+            res = Temp();
+            L(cat(any->rets.size() > 1 ? RetStruct(any->rets, c->line) : TypeName(any->rets[0], c->line), " ",
+                  res, ";"));
+        }
+        auto n = ei->en->variants.size();
+        for (size_t vi = 0; vi < n; vi++) {
+            auto sp = c->dispatch[vi];
+            if (!sp) Fail(c, "internal: a variant without its case");
+            if (vi == 0) L(cat("if (", vals[k], ".tag == 0u) {"));
+            else if (vi + 1 < n) L(cat("} else if (", vals[k], ".tag == ", vi, "u) {"));
+            else L("} else {");
+            fs->ind++;
+            vector<string> args;
+            if (msl()) args.push_back("gs");
+            for (size_t i = 0; i < vals.size(); i++) {
+                auto pt = i < sp->argtypes.size() ? sp->argtypes[i] : nullptr;
+                if ((int)i == k && pt && (pt->kind == TY_VARIANT ||
+                                          (pt->kind == TY_REF && pt->ref->sub->kind == TY_VARIANT)))
+                    args.push_back(UnpackVariant(ei, (int)vi, vals[i], c->line));
+                else args.push_back(Convert(vals[i], an[i]->exprtype, pt, c->line));
+            }
+            auto name = EnsureFn(sp, c->line);
+            string call = cat(name, "(");
+            for (size_t i = 0; i < args.size(); i++) call += cat(i ? ", " : "", args[i]);
+            call += ")";
+            if (res.empty()) L(call + ";");
+            else L(cat(res, " = ", call, ";"));
+            FromCheck(sp, c->line);
+            fs->ind--;
+        }
+        L("}");
+        return res;
+    }
+
     // A wave intrinsic (stdlib/gpu_shader.goose), compute and fragment
     // entries.
     bool simd = false;
@@ -1323,6 +1762,9 @@ struct GpuEmitter {
                 if (b->tail) Into(b->tail, dst);
                 return;
             }
+            case NK_MatchExpr:
+                MatchInto((MatchExpr *)n, dst);
+                return;
             case NK_LoopExpr: {
                 auto lp = (LoopExpr *)n;
                 fs->breakdsts.push_back(dst);
@@ -1567,6 +2009,7 @@ struct GpuEmitter {
                 return;
             }
             case NK_Continue: L("continue;"); return;
+            case NK_MatchExpr: MatchInto((MatchExpr *)n, ""); return;
             case NK_FnDecl: Fail(n, "nested functions do not run on the GPU yet");
             case NK_Call: {
                 // A call whose value is a temporary did its work in the
@@ -1814,6 +2257,9 @@ struct GpuEmitter {
     int64_t pushsize = 0, uniformsize = 0;
     pair<string, string> BlockDecl(VarDef *v, int k) {
         auto pt = k ? v->type->ref->sub : v->type;
+        if (HasAdt(pt))
+            Fail(v->line, cat(k ? "a uniform block" : "push constants", " holding an ADT do not run on the "
+                              "GPU yet: read it from a buffer"));
         auto tn = TypeName(pt, v->line, true);
         auto size = PackedSize(pt, v->line);
         auto limit = k ? 65536 : 128;

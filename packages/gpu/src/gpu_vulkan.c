@@ -917,13 +917,16 @@ static void write_heap(uint32_t slot, VkDescriptorType type, VkDescriptorBufferI
 static int vk_buffer_create(uint32_t slot, int64_t usage, const void *data, int64_t size) {
     (void)usage;
     vkbuffer *vb = &buffers[slot];
-    if (!host_buffer(vb, (VkDeviceSize)size,
+    /* Whole 16-byte units, zero past the data: a shader reading a word
+       that straddles the end stays inside (gpu_language.md §5). */
+    int64_t alloc = (size + 15) & ~(int64_t)15;
+    if (!host_buffer(vb, (VkDeviceSize)alloc,
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT))
         return 0;
+    memset(vb->mapped, 0, (size_t)alloc);
     if (data) memcpy(vb->mapped, data, (size_t)size);
-    else memset(vb->mapped, 0, (size_t)size);
     VkDescriptorBufferInfo info = { vb->buffer, 0, VK_WHOLE_SIZE };
     write_heap(slot, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &info, NULL);
     return 1;

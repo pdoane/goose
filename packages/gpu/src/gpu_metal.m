@@ -340,14 +340,17 @@ static id<MTL4ComputeCommandEncoder> open_compute(void) {
 
 static int mtl_buffer_create(uint32_t slot, int64_t usage, const void *data, int64_t size) {
     (void)usage;
-    id<MTLBuffer> b = [device newBufferWithLength:(NSUInteger)size
+    /* Whole 16-byte units, zero past the data: a shader reading a word
+       that straddles the end stays inside (gpu_language.md §5). */
+    int64_t alloc = (size + 15) & ~(int64_t)15;
+    id<MTLBuffer> b = [device newBufferWithLength:(NSUInteger)alloc
                                           options:MTLResourceStorageModeShared];
     if (!b) {
         goose_gpu_fail("cannot make a buffer of %lld bytes", (long long)size);
         return 0;
     }
+    memset(b.contents, 0, (size_t)alloc);
     if (data) memcpy(b.contents, data, (size_t)size);
-    else memset(b.contents, 0, (size_t)size);
     buffers[slot] = b;
     ((uint64_t *)heap.contents)[slot] = b.gpuAddress;
     [residency addAllocation:b];
