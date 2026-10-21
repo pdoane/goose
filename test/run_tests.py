@@ -78,6 +78,7 @@ import concurrent.futures
 import os
 import re
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -1448,7 +1449,8 @@ def main():
     # of the goose_in_goose bootstrap are exercised through their entry points.
     # The lsp/ fixtures are the language server's, driven by lsp_protocol.py.
     tests = [f for f in sorted(HERE.glob("*/*.goose"))
-             if f.parent.name not in ("errors", "errors_tc", "goose_in_goose", "lsp") and
+             if f.parent.name not in ("errors", "errors_tc", "goose_in_goose", "lsp",
+                                      "gpu_emit") and
              f.name != "lexer_tokens.goose"]
     if len({f.stem for f in tests}) != len(tests):
         ap.error("fixture names must be unique across categories (shared expected/ and build outputs)")
@@ -1606,6 +1608,37 @@ def main():
             r.ok("compile-shader probe_badset.frag")
     r.show_task(shader_probe)
     r.show_task(shader_badset)
+
+    # GPU functions (docs/design/gpu.md §6): the HLSL and MSL each fixture's
+    # entry points emit, compared as text, which needs no shader compiler
+    # (--check emits without compiling). Line directives name the source by
+    # its file name alone, so the text is the same on every machine.
+    def gpu_emit(f):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, err = r.goose("--check", "--emit-shaders", tmp, f)
+            if code != 0:
+                r.fail(f"gpu emit {f.name}", out + err)
+                return
+            text = ""
+            for emitted in sorted(Path(tmp).iterdir()):
+                body = emitted.read_text(encoding="utf-8")
+                body = re.sub(r'^(#line \d+ ")[^"]*[/\\]([^"/\\]+")', r"\1\2", body,
+                              flags=re.M)
+                text += f"==== {emitted.name}\n{body}"
+        if r.check_stdout(f"gpu_emit_{f.stem}", f"gpu emit {f.name}", joined(text)):
+            r.ok(f"gpu emit {f.name}")
+    for f in sorted((HERE / "gpu_emit").glob("*.goose")):
+        r.show_task(gpu_emit, f)
+
+    # The shader library's header, which the gpu package keeps a copy of.
+    def gpu_library_copy():
+        mine = (HERE.parent / "src" / "gpu_library.h").read_bytes()
+        theirs = (HERE.parent / "packages" / "gpu" / "src" / "gpu_library.h").read_bytes()
+        if mine != theirs:
+            r.fail("packages/gpu/src/gpu_library.h is src/gpu_library.h")
+        else:
+            r.ok("packages/gpu/src/gpu_library.h is src/gpu_library.h")
+    r.show_task(gpu_library_copy)
 
     # An error in shader source written in the program is reported at its own
     # line of the program: the one using `oops` in these fixtures.

@@ -1,7 +1,8 @@
 /* The gpu package's C (docs/design/gpu.md §3): the layer the Goose externs
    call (gpu.c), over one backend at a time (gpu_metal.m, gpu_vulkan.c).
    The common layer owns everything the backends need not differ on: slots
-   and their handles, the recording state, read backs, errors. A backend
+   and what they hold, pipelines and their state, the recording state, the
+   access each texture was last left in, read backs and errors. A backend
    owns the device objects. */
 
 #ifndef GOOSE_GPU_INTERNAL_H
@@ -16,41 +17,155 @@
 typedef struct { const uint8_t *data; int64_t len; } goose_gpu_bytes;
 
 /* The resource heap's size, in slots. Slot 0 is the stream's (§3), unused
-   so far, which keeps 0 meaning "no buffer". */
+   so far, which keeps 0 meaning "none". */
 #define GOOSE_GPU_HEAP_SLOTS 16384
 #define GOOSE_GPU_MAX_PIPELINES 1024
+#define GOOSE_GPU_MAX_TARGETS 4
+#define GOOSE_GPU_SAMPLERS 64
 
-/* A pipeline as the common layer knows it: what its library said. */
+/* gpu.goose's constants, which are gfx's (docs/stdlib.md §gfx). */
+enum {
+    GOOSE_GPU_RGBA8 = 1, GOOSE_GPU_BGRA8, GOOSE_GPU_RGBA8_SRGB, GOOSE_GPU_R8, GOOSE_GPU_RG8,
+    GOOSE_GPU_RGBA16F, GOOSE_GPU_RGBA32F, GOOSE_GPU_R16F, GOOSE_GPU_RG16F, GOOSE_GPU_R32F,
+    GOOSE_GPU_RG32F, GOOSE_GPU_R32UI, GOOSE_GPU_RGBA8UI, GOOSE_GPU_RGB10A2, GOOSE_GPU_RG11B10F,
+    GOOSE_GPU_DEPTH16, GOOSE_GPU_DEPTH24, GOOSE_GPU_DEPTH32F, GOOSE_GPU_DEPTH24_STENCIL8,
+    GOOSE_GPU_DEPTH, GOOSE_GPU_FORMAT_END,
+};
+enum { GOOSE_GPU_SAMPLED = 1, GOOSE_GPU_COLOR_TARGET = 2, GOOSE_GPU_DEPTH_TARGET = 4,
+       GOOSE_GPU_STORAGE = 8 };
+enum { GOOSE_GPU_TRIANGLES, GOOSE_GPU_TRIANGLE_STRIP, GOOSE_GPU_LINES, GOOSE_GPU_LINE_STRIP,
+       GOOSE_GPU_POINTS };
+enum { GOOSE_GPU_CULL_NONE, GOOSE_GPU_CULL_FRONT, GOOSE_GPU_CULL_BACK };
+enum { GOOSE_GPU_BLEND_NONE, GOOSE_GPU_BLEND_ALPHA, GOOSE_GPU_BLEND_ADD,
+       GOOSE_GPU_BLEND_PREMULTIPLIED, GOOSE_GPU_BLEND_MULTIPLY };
+/* Comparisons, COMPARE_NEVER = 1 to COMPARE_ALWAYS = 8. */
+
+/* What the GPU last did with a resource, or does next (§3, barriers). */
+enum {
+    GOOSE_GPU_ACCESS_NONE = 0,
+    GOOSE_GPU_ACCESS_SHADER_READ = 1,
+    GOOSE_GPU_ACCESS_SHADER_WRITE = 2,
+    GOOSE_GPU_ACCESS_RENDER_TARGET = 4,
+    GOOSE_GPU_ACCESS_DEPTH_WRITE = 8,
+    GOOSE_GPU_ACCESS_DEPTH_READ = 16,
+    GOOSE_GPU_ACCESS_COPY_SRC = 32,
+    GOOSE_GPU_ACCESS_COPY_DST = 64,
+};
+
+#pragma pack(push, 1)
+/* gpu.goose's TextureDesc, PipelineDesc and PassDesc, as Goose lays them
+   out (packed, spec C.2). */
+typedef struct {
+    int32_t kind, format, usage, width, height, depth, mips, samples;
+} goose_gpu_texture_desc;
+
+typedef struct {
+    int32_t primitive, cull;
+    uint8_t clockwise, wireframe, depth_test, depth_write;
+    int32_t depth_compare, blend;
+} goose_gpu_pipeline_desc;
+
+typedef struct {
+    uint32_t color[GOOSE_GPU_MAX_TARGETS];
+    uint32_t depth;
+    uint8_t clear_color, clear_depth;
+    float color_value[4];
+    float depth_value;
+} goose_gpu_pass_desc;
+#pragma pack(pop)
+
+/* A texture as the common layer knows it. */
+typedef struct {
+    goose_gpu_texture_desc desc;
+    int access;             /* GOOSE_GPU_ACCESS_*, as the last barrier left it */
+} goose_gpu_tex;
+
+/* A pipeline as the common layer knows it: what its library said, and for
+   a raster one the native pipelines made for each set of target formats
+   it has drawn into (§3: made where first bound, as gfx makes them). */
+#define GOOSE_GPU_PIPELINE_VARIANTS 8
+typedef struct {
+    int32_t colors[GOOSE_GPU_MAX_TARGETS];
+    int32_t depth;
+} goose_gpu_targets;
+
 typedef struct {
     int used;
+    int compute;
     gs_gpu_lib_header header;
-    void *native;           /* the backend's */
-} goose_gpu_pipeline;
+    gs_gpu_lib_entry entries[2];
+    uint8_t *library;           /* a copy: the backend reads its code */
+    int64_t librarylen;
+    goose_gpu_pipeline_desc desc;
+    void *native;               /* compute: the backend's pipeline */
+    struct { goose_gpu_targets key; void *native; } variants[GOOSE_GPU_PIPELINE_VARIANTS];
+    int nvariants;
+} goose_gpu_pipe;
+
+/* A pass being recorded, its targets resolved. */
+typedef struct {
+    goose_gpu_pass_desc desc;
+    goose_gpu_targets formats;
+    int ncolor;
+    int width, height;
+} goose_gpu_pass;
 
 typedef struct goose_gpu_backend {
     const char *name;
     /* 0 on failure, with goose_gpu_fail called. */
     int (*open)(void);
     void (*close)(void);
-    /* A buffer of `size` bytes in heap slot `slot`, holding `data` when
-       that is not null, and visible to shaders at that index. */
+    /* A buffer of `size` bytes in heap slot `slot`, holding `data` when that
+       is not null, and visible to shaders at that index. */
     int (*buffer_create)(uint32_t slot, int64_t usage, const void *data, int64_t size);
-    void (*buffer_release)(uint32_t slot);
-    /* Reads `size` bytes from `offset` of a buffer whose writes have
-       completed, into `out`. */
-    void (*buffer_read)(uint32_t slot, int64_t offset, int64_t size, void *out);
-    int (*pipeline_create)(goose_gpu_pipeline *p, const uint8_t *library, int64_t len);
-    void (*pipeline_release)(goose_gpu_pipeline *p);
+    /* A texture in `slot`. With data (tightly packed rows of mip 0), its
+       upload is complete before the next submission runs, and leaves it in
+       its steady access, shader reads. */
+    int (*texture_create)(uint32_t slot, const goose_gpu_texture_desc *d, const void *data,
+                          int64_t len);
+    void (*release)(uint32_t slot, int texture);
+    int (*compute_create)(goose_gpu_pipe *p);
+    void *(*raster_create)(goose_gpu_pipe *p, const goose_gpu_targets *targets);
+    void (*pipeline_release)(goose_gpu_pipe *p);
     int (*begin_compute)(void);
     void (*end_compute)(void);
-    void (*dispatch)(goose_gpu_pipeline *p, const void *push, uint32_t pushsize,
+    int (*begin_pass)(const goose_gpu_pass *pass);
+    void (*end_pass)(void);
+    /* A draw or dispatch with its push constants and uniform buffer:
+       `uniformgen` changes when the uniform bytes do. */
+    void (*dispatch)(goose_gpu_pipe *p, const void *push, uint32_t pushsize,
+                     const void *uniforms, uint32_t uniformsize, uint64_t uniformgen,
                      uint32_t x, uint32_t y, uint32_t z);
-    /* Submits what was recorded, and returns its fence, from 1 up. */
+    void (*draw)(goose_gpu_pipe *p, void *native, const void *push, uint32_t pushsize,
+                 const void *uniforms, uint32_t uniformsize, uint64_t uniformgen,
+                 int indexed, uint32_t count, uint32_t instances, uint32_t first,
+                 int32_t vertex_offset, uint32_t first_instance);
+    void (*index_buffer)(uint32_t slot, int index_size);
+    void (*viewport)(float x, float y, float w, float h);
+    void (*scissor)(int32_t x, int32_t y, int32_t w, int32_t h);
+    /* Outside passes: the GPU's work with the texture in `before` done and
+       visible to its work in `after`. */
+    void (*barrier)(uint32_t slot, int before, int after);
+    /* A copy of part of a buffer, or of a texture's mip 0 left in
+       `access`, into memory the CPU reads once the submission carrying it
+       completes. Returns the backend's handle on it. */
+    void *(*readback_buffer)(uint32_t slot, int64_t offset, int64_t size);
+    void *(*readback_texture)(uint32_t slot, int access, int64_t size);
+    void (*readback_read)(void *rb, void *out, int64_t size);
+    void (*readback_release)(void *rb);
+    /* Submits what was recorded, after the uploads made since the last
+       submission, and returns its fence, from 1 up. */
     uint64_t (*submit)(void);
     /* The latest fence that has completed. */
     uint64_t (*completed)(void);
     void (*wait)(uint64_t fence);
 } goose_gpu_backend;
+
+/* The texture in a slot, for the backends; null for none. */
+const goose_gpu_tex *goose_gpu_texture_of(uint32_t slot);
+/* Bytes per texel of a format; 0 for a depth format the CPU does not read. */
+int goose_gpu_texel_size(int format);
+int goose_gpu_is_depth(int format);
 
 /* Records why the call in progress failed, for gpu::error(). */
 void goose_gpu_fail(const char *fmt, ...);

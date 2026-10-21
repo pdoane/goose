@@ -539,26 +539,43 @@ scalar converts to the component type, so an `f64` variable scaling a
 ## gpu_shader
 
 What a GPU function reaches beyond the language, in namespace `gpu`
-([design/gpu.md](design/gpu.md) §5): the system values and the buffer
-handles. A function declared `compute(x, y, z) fn` is a GPU entry point,
-compiled when the program is, and `gpu_entry(f)` is its shader library, a
-`const u8[:]` the `gpu` package makes a pipeline from.
+([design/gpu.md](design/gpu.md) §5): system values, resource handles, and
+what reads and writes them. A function declared `compute(x, y, z) fn`,
+`vertex fn` or `fragment fn` is a GPU entry point, compiled when the
+program is; `gpu_entry(cs)` or `gpu_entry(vs, fs)` is a pipeline's shader
+library, a `const u8[:]` the `gpu` package makes the pipeline from.
 
 ```goose
 fn dispatch_thread_id() -> uint3     fn group_id() -> uint3     // compute entry points
 fn group_thread_id() -> uint3        fn group_index() -> u32
 fn vertex_index() -> u32             fn instance_index() -> u32 // vertex entry points
+fn frag_coord() -> float4            fn front_facing() -> bool  // fragment entry points
+fn discard()                         fn ddx(x) fn ddy(x) fn fwidth(x)
+
 struct StructuredBuffer<T> { index: u32 }      struct RWStructuredBuffer<T> { index: u32 }
 fn load<T>(b: StructuredBuffer<T>, i: u32) -> T      // and an RWStructuredBuffer<T>
 fn store<T>(b: RWStructuredBuffer<T>, i: u32, v: T)
+
+struct Texture2D<T> { index: u32 }   struct RWTexture2D<T> { index: u32 }   struct Sampler { index: u32 }
+let POINT_CLAMP, LINEAR_CLAMP, POINT_REPEAT, LINEAR_REPEAT       // the fixed samplers
+fn sample<T>(t: Texture2D<T>, s: Sampler, uv: float2) -> T      // fragment entry points
+fn sample_level<T>(t: Texture2D<T>, s: Sampler, uv: float2, lod: f32) -> T
+fn texel<T>(t: Texture2D<T>, xy: int2, mip: i32) -> T
+fn store<T>(t: RWTexture2D<T>, xy: int2, v: T)
+
+struct mat4 { c0: float4, c1: float4, c2: float4, c3: float4 }  // column-major
+let mat4_identity
+fn mul(m: mat4, v: float4) -> float4        fn mul(a: mat4, b: mat4) -> mat4
 ```
 
-A buffer handle is its index in the resource heap, and its elements are T
-in T's Goose layout, T's packed size apart. These run in GPU functions
+A handle is its index in the resource or sampler heap. A buffer's elements
+are T in T's Goose layout, T's packed size apart; a texture's T is a number
+or a vector of them, the channels it reads. These run in GPU functions
 only: a call reached from code the CPU runs is a compile error. GPU
 functions compute in `i32`, `u32`, `f32` and `bool`, with `vec`'s vectors
-of them, structs and the control flow of the language; what else they may
-not do yet is the design note's §5.2.
+of them, structs, `let` and `const` globals built from literals, and the
+control flow of the language; what else they may not do yet is the design
+note's §5.2.
 
 ## math
 

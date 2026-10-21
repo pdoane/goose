@@ -373,12 +373,45 @@ struct GpuEmitter {
             }
             if (v->constflt) return FltText(v->constfval, id->exprtype ? id->exprtype : v->type,
                                             id->line);
+            // A let or const global initialized with literals reads as its
+            // initializer, built where it is used.
+            if (auto init = PureGlobalInit(v))
+                return Convert(X(init), init->exprtype, id->exprtype, id->line);
             Fail(id, cat("global ", v->name, " is not a constant, and the GPU reads no other "
                          "global (docs/design/gpu.md §5.2)"));
         }
         auto it = fs->locals.find(v);
         if (it == fs->locals.end()) Fail(id, cat("internal: unbound variable ", v->name));
         return Convert(it->second, v->type, id->exprtype, id->line);
+    }
+
+    // The initializer of a global no one assigns, when it is built from
+    // literals alone (and other such globals): the GPU's constants.
+    Node *PureGlobalInit(VarDef *v) {
+        if (v->isvar) return nullptr;
+        for (auto g : ast.globals)
+            for (size_t i = 0; i < g->defs.size() && i < g->inits.size(); i++)
+                if (g->defs[i] == v && !g->isvar) return PureNode(g->inits[i]) ? g->inits[i] : nullptr;
+        return nullptr;
+    }
+
+    bool PureNode(Node *n) {
+        if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n)) return true;
+        if (auto u = Is<Unary>(n)) return u->op == T_MINUS && PureNode(u->child);
+        if (auto c = Is<AsCast>(n)) return PureNode(c->child);
+        if (auto id = Is<Ident>(n))
+            return id->vdef && id->vdef->isglobal &&
+                   (id->vdef->constlit || id->vdef->constflt || PureGlobalInit(id->vdef));
+        if (auto sl = Is<StructLit>(n)) {
+            if (sl->einst || !sl->sinst) return false;
+            for (size_t i = 0; i < sl->sinst->st->fields.size(); i++) {
+                if (sl->sinst->st->fields[i].ispad) continue;
+                auto init = sl->InitFor((int)i);
+                if (!init || !PureNode(init)) return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     string UnaryX(Unary *u) {
@@ -410,11 +443,22 @@ struct GpuEmitter {
         return cat(name, "(", a, ", ", b, ")");
     }
 
+    // A shift count, any integer type in Goose (spec §6.1): masked to the
+    // 32-bit width the GPU shifts at, a literal folded.
+    string ShiftCount(Node *n) {
+        if (auto i = Is<IntLit>(n)) return cat(i->val & 31);
+        auto t = n->exprtype;
+        if (t->kind == TY_INT && (t->intstorage == IS_I32 || t->intstorage == IS_U32))
+            return cat("(", X(n), " & 31)");
+        Fail(n, cat("a shift count on the GPU is an i32, a u32 or a literal, not ", TypeStr(t)));
+    }
+
     string BinaryX(Binary *b) {
         if (b->op == T_DOTEQ || b->op == T_DOTNEQ) Fail(b, "references do not run on the GPU");
         auto lt = b->left->exprtype, rt = b->right->exprtype;
         auto l = X(b->left);
-        auto r = X(b->right);
+        auto shift = b->op == T_SHL || b->op == T_SHR;
+        auto r = shift ? ShiftCount(b->right) : X(b->right);
         auto lw = VecWidth(lt), rw = VecWidth(rt);
         if ((lt->kind == TY_STRUCT && !lw) || (rt->kind == TY_STRUCT && !rw))
             Fail(b, "elementwise arithmetic runs on the GPU on vectors only, not other structs");
@@ -451,7 +495,7 @@ struct GpuEmitter {
                 // Shift counts are masked to the width (spec §6.2), which
                 // MSL and SPIR-V leave undefined beyond it.
                 if (vec) Fail(b, "shifts on vectors do not run on the GPU yet");
-                return cat("(", l, b->op == T_SHL ? " << " : " >> ", "(", r, " & 31))");
+                return cat("(", l, b->op == T_SHL ? " << " : " >> ", r, ")");
             }
             default: break;
         }
@@ -517,18 +561,17 @@ struct GpuEmitter {
     // Element `i` of the buffer at heap index `index`, as the dialect
     // reaches it: in MSL the element itself, an lvalue; in HLSL the buffer
     // and the element's byte offset, for Load and Store.
-    pair<string, string> BufferElem(const string &index, const string &i, TypeExpr *et, Line l) {
+    pair<string, string> BufferElem(const string &index, const string &i, TypeExpr *et, Line l,
+                                    bool write) {
         auto stride = PackedSize(et, l);
         if (msl())
             return { cat("reinterpret_cast<device ", TypeName(et, l, true), " *>(gs.heap[",
                          index, "])[", i, "]"), "" };
-        string buf;
-        if (dia == GD_HLSL_SPIRV) {
-            buf = cat("gs_buffers[", index, "]");
-        } else {
-            buf = Temp();
-            L(cat("RWByteAddressBuffer ", buf, " = ResourceDescriptorHeap[", index, "];"));
-        }
+        // A load through the read-only type, which SPIR-V marks NonWritable,
+        // as a vertex stage's storage must be.
+        auto buf = Temp();
+        L(cat(write ? "RWByteAddressBuffer " : "ByteAddressBuffer ", buf,
+              " = ResourceDescriptorHeap[", index, "];"));
         return { buf, cat("(", i, ") * ", stride, "u") };
     }
 
@@ -544,7 +587,7 @@ struct GpuEmitter {
                     auto et = c->rettypes[0];
                     auto index = X(an[0]);
                     auto i = X(an[1]);
-                    auto [e, off] = BufferElem(index, i, et, c->line);
+                    auto [e, off] = BufferElem(index, i, et, c->line, false);
                     if (msl()) return VecWidth(et) ? cat(TypeName(et, c->line), "(", e, ")") : e;
                     return cat(e, ".Load<", TypeName(et, c->line), ">(", off, ")");
                 }
@@ -553,11 +596,14 @@ struct GpuEmitter {
                     auto index = X(an[0]);
                     auto i = X(an[1]);
                     auto v = X(an[2]);
-                    auto [e, off] = BufferElem(index, i, et, c->line);
+                    auto [e, off] = BufferElem(index, i, et, c->line, true);
                     if (msl()) L(cat(e, " = ", v, ";"));
                     else L(cat(e, ".Store<", TypeName(et, c->line), ">(", off, ", ", v, ");"));
                     return "";
                 }
+                case B_GPU_SAMPLE: case B_GPU_SAMPLE_LEVEL: case B_GPU_TEXEL:
+                case B_GPU_STORE_TEXEL:
+                    return TextureX(c, an);
                 case B_DEFAULT: return ZeroOf(c->exprtype, c->line);
                 default:
                     Fail(c, cat(BuiltinByKind(c->builtin).name, " does not run on the GPU"));
@@ -598,7 +644,20 @@ struct GpuEmitter {
                 { "group_index", GPU_COMPUTE, "group_index" },
                 { "vertex_index", GPU_VERTEX, "vertex_index" },
                 { "instance_index", GPU_VERTEX, "instance_index" },
+                { "frag_coord", GPU_FRAGMENT, "frag_coord" },
+                { "front_facing", GPU_FRAGMENT, "front_facing" },
             };
+            if (what == "discard") {
+                RequireStage(c, GPU_FRAGMENT, "discard()");
+                L(hlsl() ? "discard;" : "discard_fragment();");
+                return "";
+            }
+            if (what == "ddx" || what == "ddy" || what == "fwidth") {
+                RequireStage(c, GPU_FRAGMENT, cat(what, "()"));
+                auto fn = msl() && what != "fwidth" ? (what == "ddx" ? "dfdx" : "dfdy")
+                                                    : string(what);
+                return cat(fn, "(", X(an[0]), ")");
+            }
             for (auto &s : sys)
                 if (what == s.name) {
                     if (entry->sf->gpustage != s.stage)
@@ -700,6 +759,10 @@ struct GpuEmitter {
                 auto a = (Assign *)n;
                 if (a->pointee) Fail(n, "references do not run on the GPU");
                 auto lv = X(a->lval);
+                if (a->op == T_SHLEQ || a->op == T_SHREQ) {
+                    L(cat(lv, a->op == T_SHLEQ ? " <<= " : " >>= ", ShiftCount(a->rhs), ";"));
+                    return;
+                }
                 auto rhs = Convert(X(a->rhs), a->rhs->exprtype, a->lval->exprtype, n->line);
                 if (a->op == T_ASSIGN) {
                     L(cat(lv, " = ", rhs, ";"));
@@ -708,10 +771,6 @@ struct GpuEmitter {
                 auto lt = a->lval->exprtype;
                 if (a->op == T_MODEQ && lt->kind == TY_INT && lt->intstorage == IS_I32) {
                     L(cat(lv, " = ", EuclidMod(lv, rhs, "int"), ";"));
-                    return;
-                }
-                if ((a->op == T_SHLEQ || a->op == T_SHREQ)) {
-                    L(cat(lv, a->op == T_SHLEQ ? " <<= (" : " >>= (", rhs, " & 31);"));
                     return;
                 }
                 L(cat(lv, " ", TName(a->op), " ", rhs, ";"));
@@ -802,6 +861,10 @@ struct GpuEmitter {
             }
             case NK_Return: {
                 auto r = (Return *)n;
+                if (fs->spec == entry && entry->sf->gpustage != GPU_COMPUTE && !r->vals.empty()) {
+                    EntryReturn(r->vals, n->line);
+                    return;
+                }
                 if (r->target && r->target != fs->spec->sf)
                     Fail(n, "`return ... from` does not run on the GPU");
                 if (r->vals.empty()) {
@@ -893,6 +956,10 @@ struct GpuEmitter {
             return;
         }
         LineDirective(b->tail->line);
+        if (sp == entry) {
+            EntryReturn({ b->tail }, b->tail->line);
+            return;
+        }
         auto x = X(b->tail);
         L(cat("return ", Convert(x, b->tail->exprtype, sp->rets[0], b->tail->line), ";"));
     }
@@ -900,12 +967,35 @@ struct GpuEmitter {
     // ------------------------------------------------------------------
     // The entry point, and the program around it.
 
-    // The entry's push constants: the struct its first by-value parameter
-    // is, if any (§5.1).
-    VarDef *PushParam() {
-        for (auto v : entry->params)
-            if (v->type->kind != TY_REF) return v;
-        return nullptr;
+    // An entry's parameters (§5.1): a fragment entry's stage input first,
+    // then the push constants, a value, then the uniform block, a const T&.
+    VarDef *stagein = nullptr, *push = nullptr, *uniform = nullptr;
+
+    void ClassifyParams() {
+        size_t i = 0;
+        auto &ps = entry->params;
+        if (entry->sf->gpustage == GPU_FRAGMENT) {
+            if (ps.empty() || ps[0]->type->kind == TY_REF)
+                Fail(entry->sf->line, cat("fragment fn ", entry->sf->name, " takes its vertex "
+                                          "stage's varyings first, an empty struct for none"));
+            stagein = ps[i++];
+        }
+        if (i < ps.size() && ps[i]->type->kind != TY_REF) push = ps[i++];
+        if (i < ps.size() && ps[i]->type->kind == TY_REF) uniform = ps[i++];
+        if (i < ps.size())
+            Fail(ps[i]->line, cat("an entry point takes ",
+                                  entry->sf->gpustage == GPU_FRAGMENT ? "its stage input, " : "",
+                                  "push constants and a uniform block, in that order, each at "
+                                  "most once: ", ps[i]->name, " is another"));
+        if (push && (push->type->kind != TY_STRUCT || VecWidth(push->type)))
+            Fail(push->line, cat("an entry point's push constants are a struct, not ",
+                                 TypeStr(push->type)));
+        if (uniform) {
+            auto ut = uniform->type->ref->sub;
+            if (ut->kind != TY_STRUCT || VecWidth(ut))
+                Fail(uniform->line, cat("an entry point's uniform block is a struct, not ",
+                                        TypeStr(ut)));
+        }
     }
 
     // A struct's leaves, the scalars it holds at their Goose offsets: what a
@@ -965,117 +1055,375 @@ struct GpuEmitter {
         return true;
     }
 
+    // A block of push constants (k 0) or the uniform buffer (k 1): its
+    // declaration, and the statement reading it into the entry's local.
+    int64_t pushsize = 0, uniformsize = 0;
+    pair<string, string> BlockDecl(VarDef *v, int k) {
+        auto pt = k ? v->type->ref->sub : v->type;
+        auto tn = TypeName(pt, v->line, true);
+        auto size = PackedSize(pt, v->line);
+        auto limit = k ? 65536 : 128;
+        if (size > limit)
+            Fail(v->line, cat(k ? "a uniform block is at most 64 KiB" : "push constants are at "
+                              "most 128 bytes", ", and ", TypeStr(pt), " is ", size));
+        (k ? uniformsize : pushsize) = size;
+        auto name = LocalName(v);
+        auto var = k ? "gs_uniforms" : "gs_push";
+        int64_t cboff = 0;
+        if (msl() || dia == GD_HLSL_SPIRV || CbufferAgrees(pt, cboff, 0, v->line)) {
+            string decl;
+            if (dia == GD_HLSL_SPIRV)
+                decl = k ? cat("[[vk::binding(0, 1)]] ConstantBuffer<", tn, "> ", var, ";\n")
+                         : cat("[[vk::push_constant]] ConstantBuffer<", tn, "> ", var, ";\n");
+            else if (hlsl())
+                decl = cat("ConstantBuffer<", tn, "> ", var, " : register(b", k, ");\n");
+            return { decl, cat(tn, " ", name, " = ", var, ";") };
+        }
+        // Flattened (§5.3): the registers as words, each field read from its
+        // Goose offset.
+        auto words = (size + 15) / 16;
+        string decl = cat("cbuffer ", var, "_words : register(b", k, ") { uint4 ", var, "[", words,
+                          "]; };\n\n");
+        vector<Leaf> leaves;
+        Leaves(pt, "", 0, leaves, v->line);
+        decl += cat(tn, " gs_load", var + 2, "() {\n    ", tn, " r;\n");
+        static const char *comp[] = { ".x", ".y", ".z", ".w" };
+        for (auto &lf : leaves) {
+            auto w = cat(var, "[", lf.off / 16, "]", comp[(lf.off % 16) / 4]);
+            auto sn = ScalarName(lf.type, v->line);
+            auto val = sn == "float" ? cat("asfloat(", w, ")") : sn == "int" ? cat("asint(", w, ")")
+                                                                            : w;
+            decl += cat("    r", lf.path, " = ", val, ";\n");
+        }
+        decl += "    return r;\n}\n";
+        return { decl, cat(tn, " ", name, " = gs_load", var + 2, "();") };
+    }
+
+    // The fields a vertex entry passes its fragment entry, from its
+    // varyings struct: scalars and vectors only, flat when integers.
+    struct Varying { string name; TypeExpr *type; bool flat; };
+    vector<Varying> Varyings(TypeExpr *t, Line l) {
+        vector<Varying> out;
+        auto si = Inst(t, l);
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            auto &f = si->st->fields[i];
+            if (f.ispad) continue;
+            auto ft = si->ftypes[i];
+            auto et = VecWidth(ft) ? VecElem(ft) : ft;
+            if (!IsScalar(et) || et->kind == TY_BOOL)
+                Fail(f.line, cat("a varying is a number or a vector of them, not ", TypeStr(ft),
+                                 ": ", f.name));
+            out.push_back({ FieldName(f.name), ft, et->kind == TY_INT });
+        }
+        return out;
+    }
+
+    // `obj.f` of a struct value, as a value: MSL's packed vector fields
+    // unpacked (TypeName).
+    string FieldRead(const string &obj, const string &f, TypeExpr *ft, Line l) {
+        auto x = cat(obj, ".", f);
+        return msl() && VecWidth(ft) ? cat(TypeName(ft, l), "(", x, ")") : x;
+    }
+
+    // A vertex or fragment entry's return, its outputs: the clip position
+    // and varyings, or the colors.
+    void EntryReturn(const vector<Node *> &vals, Line l) {
+        auto stage = entry->sf->gpustage;
+        if (stage == GPU_VERTEX) {
+            auto clip = X(vals[0]);
+            L("gs_vertex_out gs_out;");
+            L(cat("gs_out.position = ", clip, ";"));
+            if (vals.size() > 1) {
+                auto v = X(vals[1]);
+                if (!Is<Ident>(vals[1])) {
+                    auto t = Temp();
+                    L(cat(TypeName(vals[1]->exprtype, l), " ", t, " = ", v, ";"));
+                    v = t;
+                }
+                for (auto &vy : Varyings(vals[1]->exprtype, l))
+                    L(cat("gs_out.", vy.name, " = ", FieldRead(v, vy.name, vy.type, l), ";"));
+            }
+            L("return gs_out;");
+            return;
+        }
+        if (vals.size() == 1) {
+            L(cat("return ", Convert(X(vals[0]), vals[0]->exprtype, entry->rets[0], l), ";"));
+            return;
+        }
+        L("gs_fragment_out gs_out;");
+        for (size_t k = 0; k < vals.size(); k++)
+            L(cat("gs_out.color", k, " = ", X(vals[k]), ";"));
+        L("return gs_out;");
+    }
+
+    // A texture's element type T: the scalar its texels hold, and how many
+    // of the four channels T takes.
+    pair<string, int> TexElem(TypeExpr *t, Line l) {
+        auto w = VecWidth(t);
+        auto et = w ? VecElem(t) : t;
+        if (!IsScalar(et) || et->kind == TY_BOOL)
+            Fail(l, cat("a texture holds numbers or vectors of them, not ", TypeStr(t)));
+        return { ScalarName(et, l), w ? w : 1 };
+    }
+
+    static string Narrow(const string &x, int w) {
+        static const char *sw[] = { "", ".x", ".xy", ".xyz", "" };
+        return w == 4 ? x : cat("(", x, ")", sw[w]);
+    }
+
+    static string Widen(const string &x, const string &scalar, int w) {
+        static const char *pad[] = { "", ", 0, 0, 0", ", 0, 0", ", 0", "" };
+        return w == 4 ? x : cat(scalar, "4(", x, pad[w], ")");
+    }
+
+    // The argument-buffer structs MSL reaches the heap's textures and
+    // samplers through, each declared on first use.
+    set<string> mslheaptypes;
+    string mslheapdefs;
+    string MslHeapType(const string &kind, const string &scalar) {
+        auto name = cat("GsHeap", kind, "_", scalar);
+        if (mslheaptypes.insert(name).second) {
+            auto member = kind == "Sampler" ? string("sampler")
+                        : kind == "RWTexture2D" ? cat("texture2d<", scalar, ", access::read_write>")
+                                                : cat("texture2d<", scalar, ">");
+            mslheapdefs += cat("struct ", name, " { ", member, " r; };\n");
+        }
+        return name;
+    }
+
+    // The texture at heap index `index` (`kind` Texture2D or RWTexture2D),
+    // as an expression the dialect calls methods on.
+    string TextureRef(const string &kind, const string &scalar, const string &index) {
+        if (msl())
+            return cat("reinterpret_cast<device const ", MslHeapType(kind, scalar),
+                       " *>(gs.heap)[", index, "].r");
+        auto t = Temp();
+        L(cat(kind, "<", scalar, "4> ", t, " = ResourceDescriptorHeap[", index, "];"));
+        return t;
+    }
+
+    string SamplerRef(const string &index) {
+        if (msl())
+            return cat("reinterpret_cast<device const ", MslHeapType("Sampler", "s"),
+                       " *>(gs.samplers)[", index, "].r");
+        auto t = Temp();
+        L(cat("SamplerState ", t, " = SamplerDescriptorHeap[", index, "];"));
+        return t;
+    }
+
+    void RequireStage(Call *c, int stage, const string &what) {
+        if (entry->sf->gpustage != stage)
+            Fail(c, cat(what, " exists in a ", GpuStageName(stage), " entry point only, and this "
+                        "is reached from ", GpuStageName(entry->sf->gpustage), " fn ",
+                        entry->sf->name));
+    }
+
+    // A texture builtin (stdlib/gpu_shader.goose): the coordinate of the
+    // right shape, and the texel narrowed to T.
+    string TextureX(Call *c, const vector<Node *> &an) {
+        auto check = [&](Node *n, int width, bool flt, const char *what) {
+            auto t = n->exprtype;
+            auto et = VecWidth(t) ? VecElem(t) : t;
+            if (VecWidth(t) != width || (flt ? et->kind != TY_FLT : et->kind != TY_INT))
+                Fail(n, cat(what, " is a", flt ? " float2" : "n int2 or uint2", ", not ",
+                            TypeStr(t)));
+        };
+        switch (c->builtin) {
+            case B_GPU_SAMPLE: case B_GPU_SAMPLE_LEVEL: {
+                if (c->builtin == B_GPU_SAMPLE) RequireStage(c, GPU_FRAGMENT, "sample");
+                auto [sc, w] = TexElem(c->rettypes[0], c->line);
+                check(an[2], 2, true, "a texture coordinate");
+                auto tex = TextureRef("Texture2D", sc, X(an[0]));
+                auto smp = SamplerRef(X(an[1]));
+                auto uv = X(an[2]);
+                string r;
+                if (c->builtin == B_GPU_SAMPLE)
+                    r = hlsl() ? cat(tex, ".Sample(", smp, ", ", uv, ")")
+                               : cat(tex, ".sample(", smp, ", ", uv, ")");
+                else {
+                    auto lod = X(an[3]);
+                    r = hlsl() ? cat(tex, ".SampleLevel(", smp, ", ", uv, ", ", lod, ")")
+                               : cat(tex, ".sample(", smp, ", ", uv, ", level(", lod, "))");
+                }
+                return Narrow(r, w);
+            }
+            case B_GPU_TEXEL: {
+                auto [sc, w] = TexElem(c->rettypes[0], c->line);
+                check(an[1], 2, false, "a texel coordinate");
+                auto tex = TextureRef("Texture2D", sc, X(an[0]));
+                auto xy = X(an[1]);
+                auto mip = X(an[2]);
+                return Narrow(hlsl() ? cat(tex, ".Load(int3(", xy, ", ", mip, "))")
+                                     : cat(tex, ".read(uint2(", xy, "), uint(", mip, "))"), w);
+            }
+            case B_GPU_STORE_TEXEL: {
+                auto [sc, w] = TexElem(an[2]->exprtype, c->line);
+                check(an[1], 2, false, "a texel coordinate");
+                auto tex = TextureRef("RWTexture2D", sc, X(an[0]));
+                auto xy = X(an[1]);
+                auto v = Widen(X(an[2]), sc, w);
+                if (hlsl()) L(cat(tex, "[uint2(", xy, ")] = ", v, ";"));
+                else L(cat(tex, ".write(", v, ", uint2(", xy, "));"));
+                return "";
+            }
+            default: break;
+        }
+        Fail(c, "internal: texture builtin");
+    }
+
+    // The entry point's own text: its signature, and the body, with the
+    // block declarations and the program's structs and functions it needs
+    // before it.
     string Emit() {
         auto sf = entry->sf;
+        auto stage = sf->gpustage;
         FnState st;
         st.spec = entry;
         fs = &st;
         chain.push_back(entry);
         callsites.push_back(sf->line);
         globalnames.insert(string(sf->name));
-        auto push = PushParam();
-        for (auto v : entry->params)
-            if (v != push)
-                Fail(v->line, cat("an entry point's uniform block does not run on the GPU yet: ",
-                                  v->name));
-        if (sf->gpustage != GPU_COMPUTE)
-            Fail(sf->line, cat(GpuStageName(sf->gpustage), " entry points do not compile yet: "
-                               "compute ones do (docs/design/gpu.md §10)"));
-        string pushdecl, pushload;
-        int64_t pushsize = 0;
-        if (push) {
-            auto pt = push->type;
-            if (pt->kind != TY_STRUCT || VecWidth(pt))
-                Fail(push->line, cat("an entry point's push constants are a struct, not ",
-                                     TypeStr(pt)));
-            auto tn = TypeName(pt, push->line, true);
-            pushsize = PackedSize(pt, push->line);
-            if (pushsize > 128)
-                Fail(push->line, cat("push constants are at most 128 bytes, and ", TypeStr(pt),
-                                     " is ", pushsize));
-            auto name = LocalName(push);
-            int64_t cboff = 0;
-            auto agrees = CbufferAgrees(pt, cboff, 0, push->line);
-            if (dia == GD_HLSL_SPIRV) {
-                pushdecl = cat("[[vk::push_constant]] ConstantBuffer<", tn, "> gs_push;\n");
-                pushload = cat(tn, " ", name, " = gs_push;");
-            } else if (dia == GD_HLSL_DXIL && agrees) {
-                pushdecl = cat("ConstantBuffer<", tn, "> gs_push : register(b0);\n");
-                pushload = cat(tn, " ", name, " = gs_push;");
-            } else if (dia == GD_HLSL_DXIL) {
-                // Flattened (§5.3): the registers as words, each field read
-                // from its Goose offset.
-                auto words = (pushsize + 15) / 16;
-                pushdecl = cat("cbuffer gs_push_words : register(b0) { uint4 gs_push[", words,
-                               "]; };\n");
-                vector<Leaf> leaves;
-                Leaves(pt, "", 0, leaves, push->line);
-                string fn = cat(tn, " gs_load_push() {\n    ", tn, " r;\n");
-                static const char *comp[] = { ".x", ".y", ".z", ".w" };
-                for (auto &lf : leaves) {
-                    auto w = cat("gs_push[", lf.off / 16, "]", comp[(lf.off % 16) / 4]);
-                    auto s = ScalarName(lf.type, push->line);
-                    auto v = s == "float" ? cat("asfloat(", w, ")") : s == "int" ? cat("asint(", w, ")")
-                                                                                : w;
-                    fn += cat("    r", lf.path, " = ", v, ";\n");
-                }
-                fn += "    return r;\n}\n\n";
-                pushdecl += "\n" + fn;
-                pushload = cat(tn, " ", name, " = gs_load_push();");
-            } else {
-                pushdecl = "";
-                pushload = cat(tn, " ", name, " = gs_push;");
-            }
+        for (auto n : { "gs_vertex_out", "gs_fragment_in", "gs_fragment_out", "GsCtx" })
+            globalnames.insert(n);
+        ClassifyParams();
+        if (stage == GPU_VERTEX && (entry->rets.empty() || entry->rets.size() > 2 ||
+                                    VecWidth(entry->rets[0]) != 4))
+            Fail(sf->line, cat("vertex fn ", sf->name, " returns the clip position, a float4, "
+                               "then its varyings, if any"));
+        if (stage == GPU_FRAGMENT && (entry->rets.empty() || entry->rets.size() > 8))
+            Fail(sf->line, cat("fragment fn ", sf->name, " returns one to eight colors"));
+        string decls, loads;
+        for (int k = 0; k < 2; k++) {
+            auto v = k ? uniform : push;
+            if (!v) continue;
+            auto [d, ld] = BlockDecl(v, k);
+            decls += d;
+            if (msl()) loads += cat(ld, "\n");
+            else loads += cat(ld, "\n");
         }
-        if (pushload.size()) L(pushload);
+        for (auto line = loads.find('\n'), from = (size_t)0; line != string::npos;
+             from = line + 1, line = loads.find('\n', from))
+            L(loads.substr(from, line - from));
+        // A fragment entry's stage input, built from what the rasterizer
+        // interpolated.
+        vector<Varying> ins, outs;
+        if (stagein) {
+            ins = Varyings(stagein->type, stagein->line);
+            auto tn = TypeName(stagein->type, stagein->line);
+            auto name = LocalName(stagein);
+            L(cat(tn, " ", name, ";"));
+            for (auto &vy : ins) L(cat(name, ".", vy.name, " = gs_in.", vy.name, ";"));
+        }
+        if (stage == GPU_VERTEX && entry->rets.size() > 1)
+            outs = Varyings(entry->rets[1], sf->line);
         Body(entry);
         fs = nullptr;
 
-        auto &g = sf->groupsize;
-        string out;
         auto name = string(sf->name);
+        string out = cat("// Generated by the Goose compiler from ", GpuStageName(stage), " fn ",
+                         sf->name, ".\n\n");
+        auto interp = [&](const Varying &vy, int k) {
+            if (hlsl())
+                return cat("    ", vy.flat ? "nointerpolation " : "", TypeName(vy.type, sf->line),
+                           " ", vy.name, " : TEXCOORD", k, ";\n");
+            return cat("    ", TypeName(vy.type, sf->line), " ", vy.name, " [[user(locn", k, ")",
+                       vy.flat ? ", flat" : "", "]];\n");
+        };
+        string iface;
+        if (stage == GPU_VERTEX) {
+            iface = hlsl() ? "struct gs_vertex_out {\n    float4 position : SV_Position;\n"
+                           : "struct gs_vertex_out {\n    float4 position [[position, invariant]];\n";
+            for (size_t k = 0; k < outs.size(); k++) iface += interp(outs[k], (int)k);
+            iface += "};\n\n";
+        } else if (stage == GPU_FRAGMENT) {
+            iface = hlsl() ? "struct gs_fragment_in {\n    float4 position : SV_Position;\n"
+                           : "struct gs_fragment_in {\n    float4 position [[position]];\n";
+            for (size_t k = 0; k < ins.size(); k++) iface += interp(ins[k], (int)k);
+            if (hlsl()) iface += "    bool front_facing : SV_IsFrontFace;\n";
+            iface += "};\n\n";
+            if (entry->rets.size() > 1) {
+                iface += "struct gs_fragment_out {\n";
+                for (size_t k = 0; k < entry->rets.size(); k++)
+                    iface += cat("    ", TypeName(entry->rets[k], sf->line), " color", k,
+                                 hlsl() ? cat(" : SV_Target", k) : cat(" [[color(", k, ")]]"),
+                                 ";\n");
+                iface += "};\n\n";
+            }
+        }
+        string ret = stage == GPU_COMPUTE ? "void" : stage == GPU_VERTEX ? "gs_vertex_out"
+                   : entry->rets.size() > 1 ? "gs_fragment_out" : TypeName(entry->rets[0], sf->line);
         if (hlsl()) {
-            out += "// Generated by the Goose compiler from " + string(sf->name) + ".\n\n";
             out += structdefs;
-            if (dia == GD_HLSL_SPIRV)
-                out += "[[vk::binding(0, 0)]] RWByteAddressBuffer gs_buffers[];\n";
-            out += pushdecl;
-            out += "static uint3 gs_dispatch_thread_id;\nstatic uint3 gs_group_id;\n"
-                   "static uint3 gs_group_thread_id;\nstatic uint gs_group_index;\n\n";
+            out += iface;
+            out += decls;
+            out += "\nstatic uint3 gs_dispatch_thread_id;\nstatic uint3 gs_group_id;\n"
+                   "static uint3 gs_group_thread_id;\nstatic uint gs_group_index;\n"
+                   "static uint gs_vertex_index;\nstatic uint gs_instance_index;\n"
+                   "static float4 gs_frag_coord;\nstatic bool gs_front_facing;\n\n";
             out += helperdefs;
             out += fndefs;
-            out += cat("[numthreads(", g[0], ", ", g[1], ", ", g[2], ")]\n");
-            out += cat("void ", name, "(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, "
-                       "uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex) {\n");
-            out += "    gs_dispatch_thread_id = dtid;\n    gs_group_id = gid;\n"
-                   "    gs_group_thread_id = gtid;\n    gs_group_index = gi;\n";
-            out += st.out;
-            out += "}\n";
+            string sig, setup;
+            if (stage == GPU_COMPUTE) {
+                auto &g = sf->groupsize;
+                out += cat("[numthreads(", g[0], ", ", g[1], ", ", g[2], ")]\n");
+                sig = "uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, "
+                      "uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex";
+                setup = "    gs_dispatch_thread_id = dtid;\n    gs_group_id = gid;\n"
+                        "    gs_group_thread_id = gtid;\n    gs_group_index = gi;\n";
+            } else if (stage == GPU_VERTEX) {
+                sig = "uint vid : SV_VertexID, uint iid : SV_InstanceID";
+                setup = "    gs_vertex_index = vid;\n    gs_instance_index = iid;\n";
+            } else {
+                sig = "gs_fragment_in gs_in";
+                setup = "    gs_frag_coord = gs_in.position;\n"
+                        "    gs_front_facing = gs_in.front_facing;\n";
+            }
+            out += cat(ret, " ", name, "(", sig, ")",
+                       stage == GPU_FRAGMENT && entry->rets.size() == 1 ? " : SV_Target0" : "",
+                       " {\n", setup, st.out, "}\n");
         } else {
-            out += "// Generated by the Goose compiler from " + string(sf->name) + ".\n\n";
             out += "#include <metal_stdlib>\nusing namespace metal;\n\n";
             out += structdefs;
-            out += "struct GsCtx {\n    device const ulong *heap;\n    uint3 dispatch_thread_id;\n"
-                   "    uint3 group_id;\n    uint3 group_thread_id;\n    uint group_index;\n};\n\n";
+            out += iface;
+            out += mslheapdefs;
+            if (!mslheapdefs.empty()) out += "\n";
+            out += "struct GsCtx {\n    device const ulong *heap;\n    device const ulong *samplers;\n"
+                   "    uint3 dispatch_thread_id;\n    uint3 group_id;\n    uint3 group_thread_id;\n"
+                   "    uint group_index;\n    uint vertex_index;\n    uint instance_index;\n"
+                   "    float4 frag_coord;\n    bool front_facing;\n};\n\n";
             out += helperdefs;
             out += fndefs;
-            string pushp;
-            if (push) pushp = cat("constant ", TypeName(push->type, push->line, true),
-                                  " &gs_push [[buffer(0)]], ");
-            out += cat("kernel void ", name, "(", pushp,
-                       "device const ulong *gs_heap [[buffer(2)]], "
-                       "uint3 dtid [[thread_position_in_grid]], "
-                       "uint3 gid [[threadgroup_position_in_grid]], "
-                       "uint3 gtid [[thread_position_in_threadgroup]], "
-                       "uint gi [[thread_index_in_threadgroup]]) {\n");
-            out += "    GsCtx gs { gs_heap, dtid, gid, gtid, gi };\n";
-            out += st.out;
-            out += "}\n";
+            string params;
+            if (push) params += cat("constant ", TypeName(push->type, push->line, true),
+                                    " &gs_push [[buffer(0)]], ");
+            if (uniform) params += cat("constant ", TypeName(uniform->type->ref->sub, uniform->line,
+                                                             true), " &gs_uniforms [[buffer(1)]], ");
+            params += "device const ulong *gs_heap [[buffer(2)]], "
+                      "device const ulong *gs_samplers [[buffer(3)]]";
+            string setup = "    GsCtx gs;\n    gs.heap = gs_heap;\n    gs.samplers = gs_samplers;\n";
+            string kind;
+            if (stage == GPU_COMPUTE) {
+                kind = "kernel";
+                params += ", uint3 dtid [[thread_position_in_grid]], "
+                          "uint3 gid [[threadgroup_position_in_grid]], "
+                          "uint3 gtid [[thread_position_in_threadgroup]], "
+                          "uint gi [[thread_index_in_threadgroup]]";
+                setup += "    gs.dispatch_thread_id = dtid;\n    gs.group_id = gid;\n"
+                         "    gs.group_thread_id = gtid;\n    gs.group_index = gi;\n";
+            } else if (stage == GPU_VERTEX) {
+                kind = "vertex";
+                params += ", uint vid [[vertex_id]], uint iid [[instance_id]]";
+                setup += "    gs.vertex_index = vid;\n    gs.instance_index = iid;\n";
+            } else {
+                kind = "fragment";
+                params = cat("gs_fragment_in gs_in [[stage_in]], bool ff [[front_facing]], ",
+                             params);
+                setup += "    gs.frag_coord = gs_in.position;\n    gs.front_facing = ff;\n";
+            }
+            out += cat(kind, " ", ret, " ", name, "(", params, ") {\n", setup, st.out, "}\n");
         }
-        this->pushsize = pushsize;
         return out;
     }
-    int64_t pushsize = 0;
 };
 
 // ------------------------------------------------------------------
@@ -1124,27 +1472,21 @@ inline string FindDxc() {
                          "Vulkan SDK (vulkan.lunarg.com), or DirectXShaderCompiler" };
 }
 
-inline string GpuSpirv(const string &hlsl, const string &entry) {
-    auto dxc = FindDxc();
-    vector<string> flags = { "-spirv", "-T", "cs_6_6", "-E", entry, "-HV", "2021",
-                             "-fspv-target-env=vulkan1.2", "-fvk-use-scalar-layout", "-O3" };
-    return GpuCached(hlsl, cat("spirv\n", dxc, "\n", CommandLineText(flags)), ".spv",
-                     [&](const string &src, const string &dst) {
-        vector<string> argv = { dxc };
-        for (auto &f : flags) argv.push_back(f);
-        argv.push_back("-Fo");
-        argv.push_back(dst);
-        argv.push_back(src);
-        auto r = RunProcess(argv);
-        if (!r.started || r.code != 0) throw CompileError { GpuToolFailure(argv, r) };
-    });
+inline const char *DxcProfile(int stage) {
+    return stage == GPU_VERTEX ? "vs_6_6" : stage == GPU_FRAGMENT ? "ps_6_6" : "cs_6_6";
 }
 
-inline string GpuDxil(const string &hlsl, const string &entry) {
+inline string GpuDxc(const string &hlsl, const string &entry, int stage, bool spirv) {
     auto dxc = FindDxc();
-    vector<string> flags = { "-T", "cs_6_6", "-E", entry, "-HV", "2021", "-O3" };
-    return GpuCached(hlsl, cat("dxil\n", dxc, "\n", CommandLineText(flags)), ".dxil",
-                     [&](const string &src, const string &dst) {
+    vector<string> flags = { "-T", DxcProfile(stage), "-E", entry, "-HV", "2021", "-O3" };
+    if (spirv)
+        for (auto f : { "-spirv", "-fspv-target-env=vulkan1.2", "-fvk-use-scalar-layout",
+                        "-fvk-bind-resource-heap", "0", "0", "-fvk-bind-sampler-heap", "1", "0",
+                        "-fvk-invert-y" })
+            flags.push_back(f);
+    if (spirv && stage != GPU_VERTEX) flags.pop_back();   // -fvk-invert-y: vertex only.
+    return GpuCached(hlsl, cat(spirv ? "spirv\n" : "dxil\n", dxc, "\n", CommandLineText(flags)),
+                     spirv ? ".spv" : ".dxil", [&](const string &src, const string &dst) {
         vector<string> argv = { dxc };
         for (auto &f : flags) argv.push_back(f);
         argv.push_back("-Fo");
@@ -1156,7 +1498,7 @@ inline string GpuDxil(const string &hlsl, const string &entry) {
 }
 
 inline string GpuMetallib(const string &msl) {
-    vector<string> flags = { "-std=metal3.1", "-fno-fast-math" };
+    vector<string> flags = { "-std=metal3.1", "-fno-fast-math", "-fpreserve-invariance" };
     return GpuCached(msl, cat("metallib\n", CommandLineText(flags)), ".metallib",
                      [&](const string &src, const string &dst) {
         auto air = cat(dst, ".air");
@@ -1179,87 +1521,157 @@ inline string GpuMetallib(const string &msl) {
     });
 }
 
-// The library for one entry point (src/gpu_library.h).
-inline string GpuLibrary(FnSpec *entry, int64_t pushsize, const string &name,
-                         const string *codes /* [GS_GPU_FORMAT_COUNT] */) {
+// One entry point, emitted and compiled.
+struct GpuCompiled {
+    FnSpec *entry;
+    string name;
+    string codes[GS_GPU_FORMAT_COUNT];
+    int64_t pushsize = 0, uniformsize = 0;
+};
+
+// The library of a pipeline's entry points (src/gpu_library.h).
+inline string GpuLibrary(const vector<GpuCompiled> &entries) {
     gs_gpu_lib_header h;
     memset(&h, 0, sizeof h);
     memcpy(h.magic, GS_GPU_LIB_MAGIC, 4);
     h.version = GS_GPU_LIB_VERSION;
-    h.stage = (uint8_t)entry->sf->gpustage;
-    for (int k = 0; k < 3; k++) h.group_size[k] = (uint32_t)entry->sf->groupsize[k];
-    h.push_size = (uint32_t)pushsize;
+    h.entry_count = (uint16_t)entries.size();
+    for (auto &e : entries) {
+        h.push_size = max(h.push_size, (uint32_t)e.pushsize);
+        h.uniform_size = max(h.uniform_size, (uint32_t)e.uniformsize);
+        if (e.entry->sf->gpustage == GPU_FRAGMENT) h.color_outputs = (uint32_t)e.entry->rets.size();
+    }
+    auto headsize = sizeof h + entries.size() * sizeof(gs_gpu_lib_entry);
     string tail;
     auto add = [&](const string &bytes) {
-        gs_gpu_lib_range r { (uint32_t)(sizeof h + tail.size()), (uint32_t)bytes.size() };
+        gs_gpu_lib_range r { (uint32_t)(headsize + tail.size()), (uint32_t)bytes.size() };
         tail += bytes;
         return r;
     };
-    h.name = add(name);
-    for (int f = 0; f < GS_GPU_FORMAT_COUNT; f++) h.code[f] = add(codes[f]);
     string out((const char *)&h, sizeof h);
+    for (auto &e : entries) {
+        gs_gpu_lib_entry le;
+        memset(&le, 0, sizeof le);
+        le.stage = (uint8_t)e.entry->sf->gpustage;
+        for (int k = 0; k < 3; k++) le.group_size[k] = (uint32_t)e.entry->sf->groupsize[k];
+        le.name = add(e.name);
+        for (int f = 0; f < GS_GPU_FORMAT_COUNT; f++) le.code[f] = add(e.codes[f]);
+        out += string((const char *)&le, sizeof le);
+    }
     return out + tail;
 }
 
-// Compiles every entry point the gpu_entry calls name, and gives each call
-// its library. Errors are reported, each entry point's on its own.
+// Whether two entry points of one pipeline agree on what passes between
+// them (§5.1): the vertex entry's varyings are the fragment entry's stage
+// input, and both take the same push constants and uniform block, or one
+// takes none.
+inline void GpuCheckInterface(FnSpec *vs, FnSpec *fs, Line l) {
+    auto inst = [](TypeExpr *t) { return t && t->kind == TY_STRUCT ? t->struc->inst : nullptr; };
+    auto vout = vs->rets.size() > 1 ? inst(vs->rets[1]) : nullptr;
+    auto fin = fs->params.empty() ? nullptr : inst(fs->params[0]->type);
+    auto empty = [](StructInst *si) {
+        if (!si) return true;
+        for (auto &f : si->st->fields) if (!f.ispad) return false;
+        return true;
+    };
+    if (vout != fin && !(empty(vout) && empty(fin)))
+        throw GpuError { l, cat("fragment fn ", fs->sf->name, " takes other varyings than vertex "
+                                "fn ", vs->sf->name, " passes it") };
+    auto block = [&](FnSpec *sp, bool uniform) -> StructInst * {
+        for (size_t i = sp->sf->gpustage == GPU_FRAGMENT ? 1 : 0; i < sp->params.size(); i++) {
+            auto t = sp->params[i]->type;
+            if ((t->kind == TY_REF) == uniform) return inst(uniform ? t->ref->sub : t);
+        }
+        return nullptr;
+    };
+    for (auto uniform : { false, true }) {
+        auto a = block(vs, uniform), b = block(fs, uniform);
+        if (a && b && a != b)
+            throw GpuError { l, cat("vertex fn ", vs->sf->name, " and fragment fn ", fs->sf->name,
+                                    " take different ", uniform ? "uniform blocks" : "push constants") };
+    }
+}
+
+// Compiles the entry points the gpu_entry calls name, and gives each call
+// its library. Errors are reported, each call's on its own.
 inline void CompileGpuEntries(Ast &ast, const GpuCompileOptions &opts) {
-    map<FnSpec *, const string *> done;
+    map<vector<FnSpec *>, const string *> done;
     for (auto c : ast.gpucalls) {
-        auto entry = c->gpuspec;
-        if (!entry || entry->failed) continue;
-        if (auto it = done.find(entry); it != done.end()) {
+        vector<FnSpec *> entries = { c->gpuspec };
+        if (c->gpuspec2) entries.push_back(c->gpuspec2);
+        auto failed = false;
+        for (auto e : entries) failed = failed || !e || e->failed;
+        if (failed) continue;
+        if (auto it = done.find(entries); it != done.end()) {
             c->shaderblob = it->second;
             continue;
         }
-        string texts[3];
-        GpuEmitter *em[3] = {};
-        GpuEmitter dxil(ast, GD_HLSL_DXIL, entry), spirv(ast, GD_HLSL_SPIRV, entry),
-                   metal(ast, GD_MSL, entry);
-        em[0] = &dxil;
-        em[1] = &spirv;
-        em[2] = &metal;
+        vector<GpuCompiled> compiled;
+        GpuEmitter *current = nullptr;
         try {
-            for (int k = 0; k < 3; k++) texts[k] = em[k]->Emit();
+            if (entries.size() == 2) {
+                if (entries[0]->sf->gpustage != GPU_VERTEX || entries[1]->sf->gpustage != GPU_FRAGMENT)
+                    throw GpuError { c->line, "gpu_entry(vs, fs) takes a vertex fn and then a "
+                                              "fragment fn" };
+                GpuCheckInterface(entries[0], entries[1], c->line);
+            } else if (entries[0]->sf->gpustage != GPU_COMPUTE) {
+                throw GpuError { c->line, cat("gpu_entry(", entries[0]->sf->name, ") makes a "
+                                              "compute pipeline: a ", GpuStageName(entries[0]->sf->gpustage),
+                                              " entry point needs its other stage, gpu_entry(vs, fs)") };
+            }
+            for (auto e : entries) {
+                GpuCompiled out;
+                out.entry = e;
+                out.name = string(e->sf->name);
+                string texts[3];
+                GpuEmitter dxil(ast, GD_HLSL_DXIL, e), spirv(ast, GD_HLSL_SPIRV, e),
+                           metal(ast, GD_MSL, e);
+                GpuEmitter *em[3] = { &dxil, &spirv, &metal };
+                for (int k = 0; k < 3; k++) {
+                    current = em[k];
+                    texts[k] = em[k]->Emit();
+                }
+                current = nullptr;
+                out.pushsize = dxil.pushsize;
+                out.uniformsize = dxil.uniformsize;
+                if (!opts.emitdir.empty()) {
+                    WriteFileMakingDirs(cat(opts.emitdir, "/", out.name, ".dxil.hlsl"), texts[0]);
+                    WriteFileMakingDirs(cat(opts.emitdir, "/", out.name, ".spirv.hlsl"), texts[1]);
+                    WriteFileMakingDirs(cat(opts.emitdir, "/", out.name, ".metal"), texts[2]);
+                }
+                if (opts.compile) {
+                    auto stage = e->sf->gpustage;
+                    out.codes[GS_GPU_FORMAT_SPIRV] = GpuDxc(texts[1], out.name, stage, true);
+#ifdef __APPLE__
+                    out.codes[GS_GPU_FORMAT_METALLIB] = GpuMetallib(texts[2]);
+#endif
+#ifdef _WIN32
+                    out.codes[GS_GPU_FORMAT_DXIL] = GpuDxc(texts[0], out.name, stage, false);
+#endif
+                }
+                compiled.push_back(std::move(out));
+            }
         } catch (GpuError &e) {
             Diagnostic d;
             d.where = LocOf(e.where);
             d.message = e.msg;
-            for (auto *x : em) {
-                if (x->chain.empty()) continue;
-                for (size_t i = x->chain.size(); i-- > 0;) {
-                    auto sp = x->chain[i];
+            if (current)
+                for (size_t i = current->chain.size(); i-- > 0;) {
+                    auto sp = current->chain[i];
                     auto what = sp->sf->gpustage >= 0
                                     ? cat("in ", GpuStageName(sp->sf->gpustage), " fn ", sp->sf->name)
                                     : cat("in fn ", sp->sf->name, ", called from here");
-                    d.related.push_back({ LocOf(i ? x->callsites[i] : sp->sf->line), what });
+                    d.related.push_back({ LocOf(i ? current->callsites[i] : sp->sf->line), what });
                 }
-                break;
-            }
             ast.Report(d);
-            done[entry] = nullptr;
+            done[entries] = nullptr;
             continue;
         }
-        auto name = string(entry->sf->name);
-        if (!opts.emitdir.empty()) {
-            WriteFileMakingDirs(cat(opts.emitdir, "/", name, ".dxil.hlsl"), texts[0]);
-            WriteFileMakingDirs(cat(opts.emitdir, "/", name, ".spirv.hlsl"), texts[1]);
-            WriteFileMakingDirs(cat(opts.emitdir, "/", name, ".metal"), texts[2]);
-        }
-        string codes[GS_GPU_FORMAT_COUNT];
-        if (opts.compile) {
-            codes[GS_GPU_FORMAT_SPIRV] = GpuSpirv(texts[1], name);
-#ifdef __APPLE__
-            codes[GS_GPU_FORMAT_METALLIB] = GpuMetallib(texts[2]);
-#endif
-#ifdef _WIN32
-            codes[GS_GPU_FORMAT_DXIL] = GpuDxil(texts[0], name);
-#endif
-        }
-        auto key = cat("gpu\n", entry->sf->qname);
-        ast.shaders[key] = GpuLibrary(entry, dxil.pushsize, name, codes);
-        done[entry] = &ast.shaders[key];
-        c->shaderblob = done[entry];
+        string key = "gpu";
+        for (auto e : entries) key += cat("\n", e->sf->qname);
+        ast.shaders[key] = GpuLibrary(compiled);
+        done[entries] = &ast.shaders[key];
+        c->shaderblob = done[entries];
     }
 }
 

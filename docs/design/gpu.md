@@ -814,6 +814,16 @@ Each phase lands as working commits with its tests.
    uniforms, threads and command buffers, faults (§5.6), timestamps. A port of
    `samples/27_gfx_cube.goose` is the milestone. Alongside it, `f16` in the
    language (§5.8): spec, checker, C backend and tests, then GPU functions.
+
+   *Where it stands:* headless raster is built. Vertex and fragment entry
+   points with varyings, uniform blocks, textures and samplers through the
+   heaps (DXC's `-fvk-bind-resource-heap` maps them onto the Vulkan ABI of
+   §4), and in the package textures with managed uploads, render passes,
+   pipelines made per target formats, indexed draws, barriers checked
+   against each texture's tracked access, and read backs copied where they
+   are asked for. `packages/gpu/test/raster.goose` renders a textured quad
+   exactly on both backends, under validation. Next: windows and
+   presentation, updates to resources in use, and the cube.
 3. **Direct3D 12.** By this point the HLSL emitter and the ABI have been
    exercised through Vulkan, so this is mostly the backend.
 4. **Ray tracing**, on Metal and Direct3D 12: acceleration structures, the

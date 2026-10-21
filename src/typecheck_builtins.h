@@ -143,31 +143,37 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             return first;
         }
         case B_GPU_ENTRY: {
-            // gpu_entry(f): the shader library holding the GPU entry point f,
-            // compiled after typechecking (src/gpu.h). f is named as
-            // thread_spawn names its worker, a function parameter bound to
-            // one included (docs/design/gpu.md §5.1).
-            auto eid = Is<Ident>(args[0]);
-            SFunction *esf = nullptr;
-            auto evd = eid ? LookupVar(eid->name, eid->ns) : nullptr;
-            if (eid && !(evd && !evd->isglobal) && !ScopeNameKind(eid->name))
-                for (auto sf : ast.LookupFunctions(eid->name, eid->ns))
-                    if (sf->gpustage >= 0) esf = sf;
-            const FnValBind *fvb = nullptr;
-            if (eid && !(evd && !evd->isglobal) &&
-                !LookupTypeParam(eid->name, fvb) && fvb && fvb->named) {
-                if (fvb->set) {
-                    for (auto sf : *fvb->set) if (sf->gpustage >= 0) esf = sf;
-                } else if (fvb->named->gpustage >= 0) {
-                    esf = fvb->named;
+            // gpu_entry(f), gpu_entry(vs, fs): the shader library holding a
+            // pipeline's GPU entry points, compiled after typechecking
+            // (src/gpu.h). Each is named as thread_spawn names its worker, a
+            // function parameter bound to one included (docs/design/gpu.md
+            // §5.1).
+            FnSpec *specs[2] = {};
+            for (size_t k = 0; k < args.size(); k++) {
+                auto eid = Is<Ident>(args[k]);
+                SFunction *esf = nullptr;
+                auto evd = eid ? LookupVar(eid->name, eid->ns) : nullptr;
+                if (eid && !(evd && !evd->isglobal) && !ScopeNameKind(eid->name))
+                    for (auto sf : ast.LookupFunctions(eid->name, eid->ns))
+                        if (sf->gpustage >= 0) esf = sf;
+                const FnValBind *fvb = nullptr;
+                if (eid && !(evd && !evd->isglobal) &&
+                    !LookupTypeParam(eid->name, fvb) && fvb && fvb->named) {
+                    if (fvb->set) {
+                        for (auto sf : *fvb->set) if (sf->gpustage >= 0) esf = sf;
+                    } else if (fvb->named->gpustage >= 0) {
+                        esf = fvb->named;
+                    }
                 }
+                if (!esf)
+                    Error(c, "gpu_entry's argument names a GPU entry point: a vertex, fragment or "
+                             "compute fn");
+                eid->fnref = esf;
+                eid->exprtype = fntype;
+                specs[k] = EnsureGpuSpec(esf, c->line);
             }
-            if (!esf)
-                Error(c, "gpu_entry's argument names a GPU entry point: a vertex, fragment or "
-                         "compute fn");
-            eid->fnref = esf;
-            eid->exprtype = fntype;
-            c->gpuspec = EnsureGpuSpec(esf, c->line);
+            c->gpuspec = specs[0];
+            c->gpuspec2 = specs[1];
             ast.gpucalls.push_back(c);
             c->rettypes.push_back(cu8slice);
             Val v;
@@ -175,6 +181,39 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             v.Set(nullptr, true);   // Static data, as embed_shader's.
             v.writable = false;
             return v;
+        }
+        case B_GPU_SAMPLE: case B_GPU_SAMPLE_LEVEL: case B_GPU_TEXEL: {
+            // gpu_sample<T>(texture, sampler, uv), gpu_sample_level<T>(...,
+            // lod) and gpu_texel<T>(texture, xy, mip): a texel as T, from
+            // heap indices. The coordinates' shapes are the GPU pass's to
+            // check (src/gpu.h), where the vector types are known.
+            if (c->tyargs.size() != 1)
+                Error(c, cat(d.name, " needs exactly one explicit type argument"));
+            auto t = Subst(c->tyargs[0]);
+            ValidateType(t, c->line, VT_LOCAL);
+            CheckArg(args[0], ast.inttypes[IS_U32]);
+            if (d.kind == B_GPU_TEXEL) {
+                CheckValue(args[1], nullptr);
+                CheckArg(args[2], ast.inttypes[IS_I32]);
+            } else {
+                CheckArg(args[1], ast.inttypes[IS_U32]);
+                CheckValue(args[2], nullptr);
+                if (d.kind == B_GPU_SAMPLE_LEVEL) CheckArg(args[3], ast.flttypes[FS_F32]);
+            }
+            c->rettypes.push_back(t);
+            Val v;
+            v.type = t;
+            return v;
+        }
+        case B_GPU_STORE_TEXEL: {
+            // gpu_store_texel(texture, xy, value): the mirror of gpu_texel,
+            // on a read-write texture.
+            CheckArg(args[0], ast.inttypes[IS_U32]);
+            CheckValue(args[1], nullptr);
+            auto vv = CheckValue(args[2], nullptr);
+            if (vv.type->kind == TY_VOID || !IsFlat(vv.type))
+                Error(c, cat("gpu_store_texel writes a flat value, not ", TypeStr(vv.type)));
+            return VoidVal();
         }
         case B_GPU_LOAD: {
             // gpu_load<T>(buffer, i): element i of a buffer of T, given by

@@ -1103,7 +1103,8 @@ NODE(Call)
     bool poolcheck = false;
     TypeExpr *qtype = nullptr;  // qlimit<T>: T, which names the queue (§11.2).
     const string *shaderblob = nullptr;  // embed_shader's compiled blob or embed_file's bytes, in Ast::shaders.
-    FnSpec *gpuspec = nullptr;   // gpu_entry's entry point (docs/design/gpu.md §6).
+    FnSpec *gpuspec = nullptr;   // gpu_entry's entry point (docs/design/gpu.md §6),
+    FnSpec *gpuspec2 = nullptr;  //   and a fragment entry after a vertex one.
     Call(Line l, Node *_callee) : Node(l, NKind), callee(_callee) {}
     // What the call passes for the callee's free variable v (fvremap).
     VarDef *FreeVarArg(VarDef *v) const {

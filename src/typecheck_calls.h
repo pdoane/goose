@@ -3531,7 +3531,7 @@ inline FnSpec *TypeCheck::EnsureGpuSpec(SFunction *sf, Line l) {
         if (!p.type) Error(l, cat(what, " needs fully typed parameters"));
         auto t = Subst(p.type);
         ValidateType(t, sf->line, VT_PARAM);
-        auto uniform = t->kind == TY_REF && t->ref->sub->cq && IsPlainRef(t) &&
+        auto uniform = t->kind == TY_REF && (t->cq || t->ref->sub->cq) && IsPlainRef(t) &&
                        IsFlat(t->ref->sub);
         if (!uniform && !IsFlat(t))
             Error(l, cat(what, "'s parameters are flat values, or a uniform block's const T&, "
