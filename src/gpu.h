@@ -339,6 +339,12 @@ struct GpuEmitter {
 
     string IntText(int64_t v, TypeExpr *t, Line l) {
         if (t->kind == TY_FLT) return FltText((double)v, t, l);
+        // A constant Goose left an i64, as it does literals nothing typed:
+        // a literal of its own, which the context converts, when it fits.
+        if (t->kind == TY_INT && (t->intstorage == IS_I64 || t->intstorage == IS_U64)) {
+            if (v >= INT32_MIN && v <= INT32_MAX) return v == INT32_MIN ? "(-2147483647 - 1)" : cat(v);
+            if (v >= 0 && v <= (int64_t)UINT32_MAX) return cat(v, "u");
+        }
         auto s = ScalarName(t, l);
         if (s == "uint") return cat((uint64_t)(uint32_t)v, "u");
         if (v == INT32_MIN) return "(-2147483647 - 1)";
@@ -732,9 +738,37 @@ struct GpuEmitter {
         Fail(n, cat("a shift count on the GPU is an i32, a u32 or a literal, not ", TypeStr(t)));
     }
 
+    // Integer arithmetic on literals alone, which Goose computes at i64.
+    static bool FoldLitInt(Node *n, int64_t &out) {
+        if (auto i = Is<IntLit>(n)) { out = i->val; return true; }
+        if (auto u = Is<Unary>(n)) {
+            if (!FoldLitInt(u->child, out)) return false;
+            if (u->op == T_MINUS) { out = -out; return true; }
+            if (u->op == T_BITNOT) { out = ~out; return true; }
+            return false;
+        }
+        auto b = Is<Binary>(n);
+        int64_t l, r;
+        if (!b || !FoldLitInt(b->left, l) || !FoldLitInt(b->right, r)) return false;
+        switch (b->op) {
+            case T_PLUS: out = l + r; return true;
+            case T_MINUS: out = l - r; return true;
+            case T_MUL: out = l * r; return true;
+            case T_SHL: out = r >= 0 && r < 63 ? (int64_t)((uint64_t)l << r) : 0; return true;
+            case T_SHR: out = r >= 0 && r < 63 ? l >> r : 0; return true;
+            case T_BITAND: out = l & r; return true;
+            case T_BITOR: out = l | r; return true;
+            case T_XOR: out = l ^ r; return true;
+            default: return false;
+        }
+    }
+
     string BinaryX(Binary *b) {
         double folded;
         if (b->litfloat && FoldLitFloat(b, folded)) return FltText(folded, LitFloatType(b), b->line);
+        int64_t ifold;
+        if (b->exprtype && b->exprtype->kind == TY_INT && FoldLitInt(b, ifold))
+            return IntText(ifold, b->exprtype, b->line);
         if (b->op == T_DOTEQ || b->op == T_DOTNEQ) Fail(b, "references do not run on the GPU");
         auto lt = b->left->exprtype, rt = b->right->exprtype;
         auto l = X(b->left);
@@ -1030,6 +1064,18 @@ struct GpuEmitter {
                     return msl() ? cat("gs.", s.var) : cat("gs_", s.var);
                 }
             Fail(c, cat("internal: unknown GPU intrinsic ", cn));
+        }
+        // floor, ceil, round and trunc on f32 are C's own (stdlib/math.goose).
+        // C rounds halves away from zero, as MSL's round does and HLSL's
+        // need not.
+        if (cn == "floorf" || cn == "ceilf" || cn == "truncf" || cn == "roundf") {
+            auto x = X(an[0]);
+            if (cn == "roundf" && hlsl()) {
+                auto t = Temp();
+                L(cat("const float ", t, " = ", x, ";"));
+                return cat("(sign(", t, ") * floor(abs(", t, ") + 0.5f))");
+            }
+            return cat(cn.substr(0, cn.size() - 1), "(", x, ")");
         }
         // libm under the runtime's names (stdlib/math.goose).
         static const unordered_set<string_view> math = {
