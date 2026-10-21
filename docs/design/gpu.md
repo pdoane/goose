@@ -952,6 +952,9 @@ Each phase lands as working commits with its tests.
 
 ## 11. Open questions
 
+What of the language past §5.2's subset runs on the GPU, and how, is
+[design/gpu_language.md](gpu_language.md).
+
 * **UFCS across namespaces.** `tex.sample(s, uv)` in §5.4 assumes a
   method call finds `gpu::sample`, but UFCS resolves only in the caller's
   own namespace (docs/design/namespaces.md), so user code writes

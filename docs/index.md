@@ -79,8 +79,11 @@ and the reference describe what was built; these say why.
 * [Column arrays](design/soa.md): a struct-of-arrays storage proposal, not
   implemented.
 * [A modern GPU stack](design/gpu.md): a bindless `gpu` package with ray
-  queries, and shaders written as Goose functions; a proposal, not
-  implemented.
+  queries, and shaders written as Goose functions; Metal 4 and Vulkan built,
+  Direct3D 12 not yet.
+* [Goose on the GPU](design/gpu_language.md): the rest of the language in
+  shaders, from references and ADTs to data stacks, relative references
+  and recursion; a plan, partly implemented.
 * [WebAssembly](design/wasm.md): running without address-space reservation,
   fixed partitions against relocating stacks; a proposal.
 
