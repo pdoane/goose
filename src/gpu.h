@@ -77,6 +77,7 @@ struct GpuEmitter {
         string out;
         int ind = 1;
         unordered_map<VarDef *, string> locals;
+        set<VarDef *> aliases;          // `for &x`'s bindings: the element itself.
         set<string> names;
         int temps = 0;
         // The destination a value-giving loop's breaks assign, innermost last.
@@ -123,6 +124,13 @@ struct GpuEmitter {
 
     static TypeExpr *VecElem(const TypeExpr *t) { return t->struc->args[0]; }
 
+    // A fixed array T[k], the only array kind on the GPU: its detail, else
+    // null.
+    static TypeArray *FixedArray(const TypeExpr *t) {
+        return t->kind == TY_ARRAY && t->arr->akind == A_FIXED && t->arr->size >= 0 ? t->arr
+                                                                                    : nullptr;
+    }
+
     string ScalarName(const TypeExpr *t, Line l) {
         if (t->kind == TY_BOOL) return "bool";
         if (t->kind == TY_FLT) {
@@ -163,6 +171,9 @@ struct GpuEmitter {
             return cat(e, w);
         }
         if (t->kind == TY_STRUCT) return StructName(t, l);
+        if (FixedArray(t)) return ArrayName(t, l);
+        if (t->kind == TY_ARRAY)
+            Fail(l, cat("only fixed arrays run on the GPU, T[k], not ", TypeStr(t)));
         if (t->kind == TY_REF)
             Fail(l, cat("references do not run on the GPU, except an entry point's uniform "
                         "block: ", TypeStr(t)));
@@ -197,6 +208,7 @@ struct GpuEmitter {
         if (t->kind == TY_BOOL) Fail(l, "bool has no layout on the GPU: use u32");
         if (IsScalar(t)) return 4;
         if (auto w = VecWidth(t)) return PackedSize(VecElem(t), l) * w;
+        if (auto a = FixedArray(t)) return PackedSize(a->sub, l) * a->size;
         if (t->kind == TY_STRUCT) {
             auto si = Inst(t, l);
             int64_t size = 0;
@@ -251,6 +263,45 @@ struct GpuEmitter {
         if (body.empty()) body = "    uint gs_empty;\n";
         structdefs += cat("struct ", name, " {\n", body, "};\n\n");
         return name;
+    }
+
+    // A fixed array, as a struct around a C array in both dialects: a value
+    // that copies, passes and returns as Goose's does, which a bare array
+    // does in neither. Its elements take their form in memory, MSL's packed
+    // vectors among them, so that it lays out as Goose packs it wherever it
+    // is; reading a vector element unpacks it (ElemRead).
+    unordered_map<string, string> arraynames;
+    string ArrayName(TypeExpr *t, Line l) {
+        auto a = FixedArray(t);
+        auto et = TypeName(a->sub, l, true);
+        auto key = cat(et, "[", a->size, "]");
+        if (auto it = arraynames.find(key); it != arraynames.end()) return it->second;
+        if (a->size == 0) Fail(l, "an empty array does not run on the GPU");
+        // gs_ names are the emitter's own (GpuReservedName), unique by the key.
+        auto name = cat("gs_array_", Mangle(a->sub), "_", a->size);
+        globalnames.insert(name);
+        arraynames[key] = name;
+        structdefs += cat("struct ", name, " {\n    ", et, " v[", a->size, "];\n};\n\n");
+        return name;
+    }
+
+    // Element `i` of the array `arr` of type `t`, as a value.
+    string ElemRead(const string &arr, const string &i, TypeExpr *t, Line l) {
+        auto et = FixedArray(t)->sub;
+        auto x = cat(arr, ".v[", i, "]");
+        return msl() && VecWidth(et) ? cat(TypeName(et, l), "(", x, ")") : x;
+    }
+
+    // An index, in the type the dialect indexes with: a literal as it is.
+    string IndexX(Node *n) {
+        if (auto i = Is<IntLit>(n)) return cat(i->val);
+        return X(n);
+    }
+
+    // The array `n` is, by value, without a reference around it.
+    static TypeExpr *ArrayType(Node *n) {
+        auto t = n->exprtype;
+        return t->kind == TY_REF ? t->ref->sub : t;
     }
 
     // ------------------------------------------------------------------
@@ -359,8 +410,11 @@ struct GpuEmitter {
             case NK_StructLit: return StructLitX((StructLit *)n);
             case NK_AsCast: {
                 auto c = (AsCast *)n;
-                auto x = X(c->child);
                 auto tt = c->totype ? c->totype : c->exprtype;
+                // A literal cast is a literal of the type: alone it is an i64.
+                if (auto i = Is<IntLit>(c->child); i && IsScalar(tt))
+                    return IntText(i->val, tt, n->line);
+                auto x = X(c->child);
                 return cat("((", TypeName(tt, n->line), ")(", x, "))");
             }
             case NK_IfExpr: case NK_Block: {
@@ -379,11 +433,16 @@ struct GpuEmitter {
                 Into(n, t);
                 return t;
             }
-            case NK_Index:
-                Fail(n, "arrays do not run on the GPU yet (docs/design/gpu.md §5.2)");
+            case NK_Index: {
+                auto ix = (Index *)n;
+                auto at = ArrayType(ix->obj);
+                if (!FixedArray(at)) TypeName(at, n->line);   // Fails, saying why.
+                auto o = X(ix->obj);
+                return ElemRead(o, IndexX(ix->idx), at, n->line);
+            }
+            case NK_ArrayLit: return ArrayLitX((ArrayLit *)n);
             case NK_StrLit: Fail(n, "strings do not run on the GPU");
             case NK_NullLit: Fail(n, "optionals do not run on the GPU");
-            case NK_ArrayLit: Fail(n, "arrays do not run on the GPU yet");
             case NK_SliceExpr: Fail(n, "slices do not run on the GPU");
             case NK_MatchExpr: Fail(n, "match does not run on the GPU yet");
             case NK_EarlyBlock: Fail(n, "`block` does not run on the GPU yet");
@@ -404,6 +463,10 @@ struct GpuEmitter {
             }
             if (v->constflt) return FltText(v->constfval, id->exprtype ? id->exprtype : v->type,
                                             id->line);
+            // A table, a global array of literals: a constant of the
+            // program's own, declared once.
+            if (auto init = PureGlobalInit(v); init && Is<ArrayLit>(init))
+                return GlobalTable(v, init, id->line);
             // A let or const global initialized with literals reads as its
             // initializer, built where it is used.
             if (auto init = PureGlobalInit(v))
@@ -433,6 +496,15 @@ struct GpuEmitter {
         if (auto id = Is<Ident>(n))
             return id->vdef && id->vdef->isglobal &&
                    (id->vdef->constlit || id->vdef->constflt || PureGlobalInit(id->vdef));
+        double folded;
+        if (auto b = Is<Binary>(n))
+            return b->exprtype && b->exprtype->kind == TY_FLT && FoldLitFloat(b, folded);
+        if (auto al = Is<ArrayLit>(n)) {
+            if (al->capexpr) return false;
+            if (al->fillval) return PureNode(al->fillval);
+            for (auto e : al->elems) if (!PureNode(e)) return false;
+            return true;
+        }
         if (auto sl = Is<StructLit>(n)) {
             if (sl->einst || !sl->sinst) return false;
             for (size_t i = 0; i < sl->sinst->st->fields.size(); i++) {
@@ -445,9 +517,83 @@ struct GpuEmitter {
         return false;
     }
 
+    // The global tables (IdentX), declared after the structs.
+    unordered_map<VarDef *, string> tables;
+    string tabledefs;
+    string GlobalTable(VarDef *v, Node *init, Line l) {
+        if (auto it = tables.find(v); it != tables.end()) return it->second;
+        auto t = init->exprtype;
+        auto tn = TypeName(t, l);
+        auto name = FreshGlobal(string(v->name));
+        tables[v] = name;
+        tabledefs += cat(msl() ? "constant " : "static const ", tn, " ", name, " = ",
+                         ConstInit(init, t, l), ";\n\n");
+        return name;
+    }
+
+    // A literal value as a brace initializer, for a table: scalars as
+    // literals of the type wanted, vectors, structs and arrays in braces.
+    string ConstInit(Node *n, TypeExpr *t, Line l) {
+        if (auto id = Is<Ident>(n)) {
+            auto v = id->vdef;
+            if (v->constlit) return IntText(v->constval, t, l);
+            if (v->constflt) return FltText(v->constfval, t, l);
+            return ConstInit(PureGlobalInit(v), t, l);
+        }
+        if (auto c = Is<AsCast>(n)) {
+            if (IsScalar(t)) {
+                double f;
+                if (auto i = Is<IntLit>(c->child)) return IntText(i->val, t, l);
+                if (FoldLitFloat(c->child, f)) return t->kind == TY_FLT ? FltText(f, t, l)
+                                                                         : IntText((int64_t)f, t, l);
+            }
+            return ConstInit(c->child, t, l);
+        }
+        if (IsScalar(t)) {
+            if (t->kind == TY_BOOL) {
+                auto b = Is<BoolLit>(n);
+                if (!b) Fail(n, "a table's bool is a literal");
+                return b->val ? "true" : "false";
+            }
+            if (auto i = Is<IntLit>(n)) return IntText(i->val, t, l);
+            if (auto u = Is<Unary>(n); u && u->op == T_MINUS) {
+                if (auto i = Is<IntLit>(u->child)) return IntText(-i->val, t, l);
+            }
+            double f;
+            if (FoldLitFloat(n, f))
+                return t->kind == TY_FLT ? FltText(f, t, l) : IntText((int64_t)f, t, l);
+            Fail(n, "a table holds literals");
+        }
+        string r = "{ ";
+        if (auto a = FixedArray(t)) {
+            auto al = Is<ArrayLit>(n);
+            if (!al) Fail(n, "a table's array is an array literal");
+            r += "{ ";
+            for (int64_t k = 0; k < a->size; k++)
+                r += cat(k ? ", " : "", ConstInit(al->fillval ? al->fillval : al->elems[k], a->sub, l));
+            return r + " } }";
+        }
+        auto sl = Is<StructLit>(n);
+        if (!sl || t->kind != TY_STRUCT) Fail(n, "a table holds literals");
+        auto si = Inst(t, l);
+        bool first = true;
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            if (si->st->fields[i].ispad) Fail(n, "a table's struct has no padding");
+            auto ft = VecWidth(t) ? VecElem(t) : si->ftypes[i];
+            r += cat(first ? "" : ", ", ConstInit(sl->InitFor((int)i), ft, l));
+            first = false;
+        }
+        return r + " }";
+    }
+
     string UnaryX(Unary *u) {
         double folded;
         if (u->litfloat && FoldLitFloat(u, folded)) return FltText(folded, LitFloatType(u), u->line);
+        // A negative literal, at the type the minus has: its literal alone
+        // is untyped, an i64.
+        if (auto i = Is<IntLit>(u->child);
+            i && u->op == T_MINUS && u->exprtype && IsScalar(u->exprtype))
+            return IntText(-i->val, u->exprtype, u->line);
         if (u->op == T_BITAND) {
             if (u->exprtype && u->exprtype->kind != TY_REF) return X(u->child);
             Fail(u, "references do not run on the GPU");
@@ -539,6 +685,9 @@ struct GpuEmitter {
 
     string DotX(Dot *d) {
         if (d->variantconst) Fail(d, "enums do not run on the GPU yet");
+        if (d->member == B_LEN) {
+            if (auto a = FixedArray(ArrayType(d->obj))) return LenText(a->size, d->exprtype, d->line);
+        }
         if (d->member >= 0) Fail(d, cat(".", d->name, " does not run on the GPU"));
         auto ot = d->obj->exprtype;
         if (ot->kind == TY_REF) ot = ot->ref->sub;
@@ -559,7 +708,36 @@ struct GpuEmitter {
             if (ot->kind == TY_REF) ot = ot->ref->sub;
             return cat(LValue(d->obj), ".", VecWidth(ot) ? string(d->name) : FieldName(d->name));
         }
+        if (auto ix = Is<Index>(n)) return cat(LValue(ix->obj), ".v[", IndexX(ix->idx), "]");
         return X(n);
+    }
+
+    // A fixed array's length where a number is wanted: an i64 as anywhere
+    // else in Goose, which on the GPU is a plain literal, as small as it is.
+    string LenText(int64_t k, TypeExpr *t, Line l) {
+        if (t && IsScalar(t)) return IntText(k, t, l);
+        return cat(k);
+    }
+
+    // `[a, b, c]` or `[v; k]`, built in a local.
+    string ArrayLitX(ArrayLit *a) {
+        auto t = a->exprtype;
+        auto fa = FixedArray(t);
+        if (!fa) TypeName(t, a->line);   // Fails, saying why.
+        auto tn = TypeName(t, a->line);
+        auto tv = Temp();
+        L(cat(tn, " ", tv, ";"));
+        if (a->fillval) {
+            auto v = Convert(X(a->fillval), a->fillval->exprtype, fa->sub, a->line);
+            auto i = Temp();
+            L(cat("for (int ", i, " = 0; ", i, " < ", fa->size, "; ", i, "++) ", tv, ".v[", i,
+                  "] = ", v, ";"));
+            return tv;
+        }
+        for (size_t i = 0; i < a->elems.size(); i++)
+            L(cat(tv, ".v[", i, "] = ",
+                  Convert(X(a->elems[i]), a->elems[i]->exprtype, fa->sub, a->elems[i]->line), ";"));
+        return tv;
     }
 
     string StructLitX(StructLit *s) {
@@ -651,6 +829,10 @@ struct GpuEmitter {
                 case B_GPU_STORE_TEXEL:
                     return TextureX(c, an);
                 case B_DEFAULT: return ZeroOf(c->exprtype, c->line);
+                case B_LEN:
+                    if (auto a = FixedArray(ArrayType(an[0])))
+                        return LenText(a->size, c->exprtype, c->line);
+                    Fail(c, "len runs on the GPU on fixed arrays only");
                 default:
                     Fail(c, cat(BuiltinByKind(c->builtin).name, " does not run on the GPU"));
             }
@@ -804,7 +986,7 @@ struct GpuEmitter {
             }
             case NK_Assign: {
                 auto a = (Assign *)n;
-                if (a->pointee) Fail(n, "references do not run on the GPU");
+                if (a->pointee && !IsAlias(a->lval)) Fail(n, "references do not run on the GPU");
                 auto lv = LValue(a->lval);
                 if (a->op == T_SHLEQ || a->op == T_SHREQ) {
                     L(cat(lv, a->op == T_SHLEQ ? " <<= " : " >>= ", ShiftCount(a->rhs), ";"));
@@ -882,9 +1064,13 @@ struct GpuEmitter {
             }
             case NK_ForLoop: {
                 auto f = (ForLoop *)n;
+                if (f->iterkind == IK_ARRAY) {
+                    ForArray(f);
+                    return;
+                }
                 if (f->iterkind != IK_RANGE && f->iterkind != IK_COUNT)
-                    Fail(n, "a for over an array does not run on the GPU yet");
-                if (f->idxdef) Fail(n, "a for with an index binding does not run on the GPU yet");
+                    Fail(n, "a for over a slice does not run on the GPU");
+                if (f->idxdef) Fail(n, "internal: an index binding on a count");
                 auto r = Is<RangeExpr>(f->iter);
                 auto ct = r ? r->exprtype : f->iter->exprtype;
                 auto ctn = TypeName(ct, n->line);
@@ -947,6 +1133,45 @@ struct GpuEmitter {
                 return;
             }
         }
+    }
+
+    // `for x in a`, `for x, i in a` and `for &x in a` over a fixed array: a
+    // counted loop, the element a copy, or for `&x` the element itself.
+    void ForArray(ForLoop *f) {
+        auto at = ArrayType(f->iter);
+        auto fa = FixedArray(at);
+        if (!fa) TypeName(at, f->line);   // Fails, saying why.
+        string arr;
+        if (f->byref) {
+            arr = LValue(f->iter);
+        } else {
+            arr = Temp();
+            L(cat("const ", TypeName(at, f->line), " ", arr, " = ", X(f->iter), ";"));
+        }
+        auto ctr = Temp();
+        fs->breakdsts.push_back("");
+        L(cat("for (int ", ctr, " = 0; ", ctr, " < ", fa->size, "; ", ctr, "++) {"));
+        fs->ind++;
+        if (f->idxdef) {
+            auto it = TypeName(f->idxdef->type, f->line);
+            L(cat("const ", it, " ", LocalName(f->idxdef), " = (", it, ")", ctr, ";"));
+        }
+        if (f->byref) {
+            fs->locals[f->vdef] = cat(arr, ".v[", ctr, "]");
+            fs->aliases.insert(f->vdef);
+        } else {
+            L(cat("const ", TypeName(f->vdef->type, f->line), " ", LocalName(f->vdef), " = ",
+                  ElemRead(arr, ctr, at, f->line), ";"));
+        }
+        Stmt(f->body);
+        fs->ind--;
+        L("}");
+        fs->breakdsts.pop_back();
+    }
+
+    bool IsAlias(Node *n) {
+        auto id = Is<Ident>(n);
+        return id && fs->aliases.count(id->vdef);
     }
 
     // ------------------------------------------------------------------
@@ -1058,6 +1283,12 @@ struct GpuEmitter {
             for (int k = 0; k < w; k++) out.push_back({ path + comp[k], VecElem(t), off + 4 * k });
             return;
         }
+        if (auto a = FixedArray(t)) {
+            auto es = PackedSize(a->sub, l);
+            for (int64_t k = 0; k < a->size; k++)
+                Leaves(a->sub, cat(path, ".v[", k, "]"), off + k * es, out, l);
+            return;
+        }
         auto si = Inst(t, l);
         for (size_t i = 0; i < si->st->fields.size(); i++) {
             auto &f = si->st->fields[i];
@@ -1084,6 +1315,15 @@ struct GpuEmitter {
             if (cboff / 16 != (cboff + size - 1) / 16) cboff = (cboff + 15) / 16 * 16;
             if (cboff != gooseoff) return false;
             cboff += size;
+            return true;
+        }
+        if (auto a = FixedArray(t)) {
+            // Each element starts a register of its own.
+            auto es = PackedSize(a->sub, l);
+            for (int64_t k = 0; k < a->size; k++) {
+                cboff = (cboff + 15) / 16 * 16;
+                if (!CbufferAgrees(a->sub, cboff, gooseoff + k * es, l)) return false;
+            }
             return true;
         }
         auto si = Inst(t, l);
@@ -1477,6 +1717,7 @@ struct GpuEmitter {
             out += structdefs;
             out += iface;
             out += decls;
+            out += tabledefs;
             out += "\nstatic uint3 gs_dispatch_thread_id;\nstatic uint3 gs_group_id;\n"
                    "static uint3 gs_group_thread_id;\nstatic uint gs_group_index;\n"
                    "static uint gs_vertex_index;\nstatic uint gs_instance_index;\n"
@@ -1514,6 +1755,7 @@ struct GpuEmitter {
                    "    uint3 dispatch_thread_id;\n    uint3 group_id;\n    uint3 group_thread_id;\n"
                    "    uint group_index;\n    uint vertex_index;\n    uint instance_index;\n"
                    "    float4 frag_coord;\n    bool front_facing;\n};\n\n";
+            out += tabledefs;
             out += helperdefs;
             out += fndefs;
             string params;
