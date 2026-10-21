@@ -29,6 +29,7 @@ devices that have no window, and load_texture and save_png fail.
     goose examples/raytrace.goose     spinning cubes with ray-traced shadows and occlusion
     goose examples/bc/compress.goose  BC1-7 texture compression on the GPU, checked against the CPU
     goose examples/sort/radix.goose   a stable radix sort of key-value pairs, checked against the CPU
+    goose examples/gltf/viewer.goose  glTF PBR with image-based lighting, JPEGs decoded on the GPU
     goose test/groups.goose           group memory, atomics and waves, checked against the CPU
     goose test/views.goose            a texture's mips written through views, then sampled
 

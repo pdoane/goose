@@ -21,6 +21,8 @@ struct Texture { index: u32 }
 let BUFFER_READ = 1;
 let BUFFER_WRITE = 2;
 let BUFFER_INDEX = 4;
+let BUFFER_INDIRECT = 8;
+let BUFFER_ACCEL_INPUT = 16;    // what an acceleration structure is built from (§7)
 
 // Textures, as gfx's.
 let TEXTURE_2D: i32 = 0;
