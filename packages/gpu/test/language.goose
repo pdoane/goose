@@ -48,6 +48,21 @@ fn order(p: Pair) -> Pair, bool {
     return p, false;
 }
 
+// A long-distance return: the search's answer leaves check, two calls
+// down, for find.
+fn check(x: u32, want: u32, k: u32) {
+    if x == want { return k as i32 from find; }
+}
+
+fn scan(xs: u32[8], want: u32) {
+    for k: u32 in 8 { check(xs[k], want, k); }
+}
+
+fn find(xs: u32[8], want: u32) -> i32 {
+    scan(xs, want);
+    -1
+}
+
 struct Result {
     pos: float3,
     hits: u32,
@@ -59,6 +74,7 @@ struct Result {
     sorted: u32[4],
     flipped: u32,
     a: i32,
+    found: i32,
 }
 
 fn work(i: u32) -> Result {
@@ -74,10 +90,12 @@ fn work(i: u32) -> Result {
     var p = Pair { a: 5 - i as i32, b: i };
     let o, flipped = order(p);
     // A reference local names what it is bound to.
+    let table: u32[8] = [3, 1, 4, 1, 5, 9, 2, 6];
+    let found = find(table, i % 11);
     let first .= xs[0];
     first += 100;
     Result { pos: b.pos, hits: b.hits, energy: energy(b), q: q, r: r, lo: lo, hi: hi, sorted: xs,
-             flipped: if flipped { 1 } else { 0 }, a: o.a }
+             flipped: if flipped { 1 } else { 0 }, a: o.a, found: found }
 }
 
 struct Push { out: gpu::RWStructuredBuffer<Result>, n: u32 }
@@ -111,7 +129,8 @@ fn main() {
         let close = abs(g.pos.x - want.pos.x) < 1e-3 && abs(g.pos.y - want.pos.y) < 1e-3 &&
                     abs(g.energy - want.energy) < 1e-2;
         if !close || g.hits != want.hits || g.q != want.q || g.r != want.r || g.lo != want.lo ||
-           g.hi != want.hi || g.sorted != want.sorted || g.flipped != want.flipped || g.a != want.a {
+           g.hi != want.hi || g.sorted != want.sorted || g.flipped != want.flipped || g.a != want.a ||
+           g.found != want.found {
             if wrong < 4 {
                 print("invocation ", i, ": hits ", g.hits, "/", want.hits, " q ", g.q, "/", want.q, " lo ", g.lo,
                       "/", want.lo, " sorted ", g.sorted[0], ",", g.sorted[1], ",", g.sorted[2], ",", g.sorted[3],

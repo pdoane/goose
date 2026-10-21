@@ -51,7 +51,7 @@ void fill(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gtid :
 #line 10 "cbuffer_flatten.goose"
     const uint i = ((id.y * 8u) + id.x);
 #line 11 "cbuffer_flatten.goose"
-    if ((i < p.count)) {
+    if (i < p.count) {
 #line 11 "cbuffer_flatten.goose"
         gpu_store(p.out_, i, p.color);
     }
@@ -106,7 +106,7 @@ kernel void fill(constant Push &gs_push [[buffer(0)]], device const ulong *gs_he
 #line 10 "cbuffer_flatten.goose"
     const uint i = ((id.y * 8u) + id.x);
 #line 11 "cbuffer_flatten.goose"
-    if ((i < p.count)) {
+    if (i < p.count) {
 #line 11 "cbuffer_flatten.goose"
         gpu_store(gs, p.out_, i, float4(p.color));
     }
@@ -153,7 +153,7 @@ void fill(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gtid :
 #line 10 "cbuffer_flatten.goose"
     const uint i = ((id.y * 8u) + id.x);
 #line 11 "cbuffer_flatten.goose"
-    if ((i < p.count)) {
+    if (i < p.count) {
 #line 11 "cbuffer_flatten.goose"
         gpu_store(p.out_, i, p.color);
     }

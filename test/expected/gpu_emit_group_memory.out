@@ -62,7 +62,7 @@ uint group_prefix(uint x, uint tid) {
 #line 14 "group_memory.goose"
     const uint before = WavePrefixSum(x);
 #line 15 "group_memory.goose"
-    if ((WaveGetLaneIndex() == (lanes - 1u))) {
+    if (WaveGetLaneIndex() == (lanes - 1u)) {
 #line 15 "group_memory.goose"
         totals.value.v[(tid / lanes)] = (before + x);
     }
@@ -122,7 +122,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 24 "group_memory.goose"
     const uint tid = gs_group_index;
 #line 25 "group_memory.goose"
-    if ((tid < 16u)) {
+    if (tid < 16u) {
 #line 25 "group_memory.goose"
         counts.value.v[tid] = 0u;
     }
@@ -145,7 +145,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 32 "group_memory.goose"
     const uint at = group_prefix((key & 1u), tid);
 #line 33 "group_memory.goose"
-    if ((tid < 16u)) {
+    if (tid < 16u) {
 #line 33 "group_memory.goose"
         gpu_atomic_add(p.out_, tid, counts.value.v[tid]);
     }
@@ -154,7 +154,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 35 "group_memory.goose"
     gpu_compare_exchange(p.out_, 17u, 0u, WaveActiveCountBits((key > 7u)));
 #line 36 "group_memory.goose"
-    if ((WaveActiveAllTrue((key < 100u)) && WaveActiveAnyTrue((key == 3u)))) {
+    if (WaveActiveAllTrue((key < 100u)) && WaveActiveAnyTrue((key == 3u))) {
 #line 37 "group_memory.goose"
         gpu_store(p.out_, (18u + WavePrefixCountBits(true)), ((((WaveReadLaneAt(key, 0u) + WaveReadLaneFirst(key)) + WaveActiveMin(key)) + WaveActiveMax(key)) + WaveActiveSum(key)));
     }
@@ -222,7 +222,7 @@ uint group_prefix(thread GsCtx &gs, uint x, uint tid) {
 #line 14 "group_memory.goose"
     const uint before = simd_prefix_exclusive_sum(x);
 #line 15 "group_memory.goose"
-    if ((gs.simd_lane == (lanes - 1u))) {
+    if (gs.simd_lane == (lanes - 1u)) {
 #line 15 "group_memory.goose"
         (*gs.totals).value.v[(tid / lanes)] = (before + x);
     }
@@ -287,7 +287,7 @@ kernel void histogram(constant Push &gs_push [[buffer(0)]], device const ulong *
 #line 24 "group_memory.goose"
     const uint tid = gs.group_index;
 #line 25 "group_memory.goose"
-    if ((tid < 16u)) {
+    if (tid < 16u) {
 #line 25 "group_memory.goose"
         (*gs.counts).value.v[tid] = 0u;
     }
@@ -311,7 +311,7 @@ kernel void histogram(constant Push &gs_push [[buffer(0)]], device const ulong *
 #line 32 "group_memory.goose"
     const uint at = group_prefix(gs, (key & 1u), tid);
 #line 33 "group_memory.goose"
-    if ((tid < 16u)) {
+    if (tid < 16u) {
 #line 33 "group_memory.goose"
         gpu_atomic_add(gs, p.out_, tid, (*gs.counts).value.v[tid]);
     }
@@ -320,7 +320,7 @@ kernel void histogram(constant Push &gs_push [[buffer(0)]], device const ulong *
 #line 35 "group_memory.goose"
     gpu_compare_exchange(gs, p.out_, 17u, 0u, uint(popcount(static_cast<simd_vote::vote_t>(simd_ballot((key > 7u))))));
 #line 36 "group_memory.goose"
-    if ((simd_all((key < 100u)) && simd_any((key == 3u)))) {
+    if (simd_all((key < 100u)) && simd_any((key == 3u))) {
 #line 37 "group_memory.goose"
         gpu_store(gs, p.out_, (18u + simd_prefix_exclusive_sum((true) ? 1u : 0u)), ((((simd_shuffle(key, ushort(0u)) + simd_broadcast_first(key)) + simd_min(key)) + simd_max(key)) + simd_sum(key)));
     }
@@ -382,7 +382,7 @@ uint group_prefix(uint x, uint tid) {
 #line 14 "group_memory.goose"
     const uint before = WavePrefixSum(x);
 #line 15 "group_memory.goose"
-    if ((WaveGetLaneIndex() == (lanes - 1u))) {
+    if (WaveGetLaneIndex() == (lanes - 1u)) {
 #line 15 "group_memory.goose"
         totals.value.v[(tid / lanes)] = (before + x);
     }
@@ -442,7 +442,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 24 "group_memory.goose"
     const uint tid = gs_group_index;
 #line 25 "group_memory.goose"
-    if ((tid < 16u)) {
+    if (tid < 16u) {
 #line 25 "group_memory.goose"
         counts.value.v[tid] = 0u;
     }
@@ -465,7 +465,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 32 "group_memory.goose"
     const uint at = group_prefix((key & 1u), tid);
 #line 33 "group_memory.goose"
-    if ((tid < 16u)) {
+    if (tid < 16u) {
 #line 33 "group_memory.goose"
         gpu_atomic_add(p.out_, tid, counts.value.v[tid]);
     }
@@ -474,7 +474,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 35 "group_memory.goose"
     gpu_compare_exchange(p.out_, 17u, 0u, WaveActiveCountBits((key > 7u)));
 #line 36 "group_memory.goose"
-    if ((WaveActiveAllTrue((key < 100u)) && WaveActiveAnyTrue((key == 3u)))) {
+    if (WaveActiveAllTrue((key < 100u)) && WaveActiveAnyTrue((key == 3u))) {
 #line 37 "group_memory.goose"
         gpu_store(p.out_, (18u + WavePrefixCountBits(true)), ((((WaveReadLaneAt(key, 0u) + WaveReadLaneFirst(key)) + WaveActiveMin(key)) + WaveActiveMax(key)) + WaveActiveSum(key)));
     }

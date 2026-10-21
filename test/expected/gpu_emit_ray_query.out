@@ -112,7 +112,7 @@ void shade(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gtid 
 #line 13 "ray_query.goose"
     float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);
 #line 14 "ray_query.goose"
-    if ((h.kind == 1u)) {
+    if (h.kind == 1u) {
 #line 15 "ray_query.goose"
         gpu_Ray t1;
         t1.origin = (r.origin + (r.dir * h.t));
@@ -245,7 +245,7 @@ kernel void shade(constant Push &gs_push [[buffer(0)]], device const ulong *gs_h
 #line 13 "ray_query.goose"
     float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);
 #line 14 "ray_query.goose"
-    if ((h.kind == 1u)) {
+    if (h.kind == 1u) {
 #line 15 "ray_query.goose"
         gpu_Ray t1;
         t1.origin = (float3(r.origin) + (float3(r.dir) * h.t));
@@ -374,7 +374,7 @@ void shade(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gtid 
 #line 13 "ray_query.goose"
     float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);
 #line 14 "ray_query.goose"
-    if ((h.kind == 1u)) {
+    if (h.kind == 1u) {
 #line 15 "ray_query.goose"
         gpu_Ray t1;
         t1.origin = (r.origin + (r.dir * h.t));

@@ -292,6 +292,82 @@ struct GpuEmitter {
         return name;
     }
 
+    // An expression without the parentheses around the whole of it, for a
+    // condition's own: `if ((a == b))` draws compilers' warnings.
+    static string Bare(const string &x) {
+        if (x.size() < 2 || x.front() != '(' || x.back() != ')') return x;
+        int depth = 0;
+        for (size_t i = 0; i < x.size(); i++) {
+            if (x[i] == '(') depth++;
+            else if (x[i] == ')' && --depth == 0 && i + 1 < x.size()) return x;
+        }
+        return x.substr(1, x.size() - 2);
+    }
+
+    // `return … from` (design/gpu_language.md §4): as the C backend does it,
+    // a flag naming the target the value is for, which every call that can
+    // carry one tests, and a channel per target for the value, per
+    // invocation (HLSL's static globals, MSL's context).
+    unordered_map<FnSpec *, int> fromids;
+    string rfdecls;          // The channels' declarations, HLSL's or the context's fields.
+    bool usesrf = false;
+    string Rf() { return msl() ? "gs.rf" : "gs_rf"; }
+    int FromId(FnSpec *t, Line l) {
+        if (auto it = fromids.find(t); it != fromids.end()) return it->second;
+        if (t->sf->gpustage >= 0 && t->sf->gpustage != GPU_COMPUTE)
+            Fail(l, cat("`return … from` a ", GpuStageName(t->sf->gpustage), " entry point does not "
+                        "run on the GPU yet"));
+        auto id = (int)fromids.size() + 1;
+        fromids[t] = id;
+        usesrf = true;
+        for (size_t i = 0; i < t->rets.size(); i++) {
+            auto tn = TypeName(t->rets[i], l);
+            rfdecls += msl() ? cat("    ", tn, " lret_", id, "_", i, ";\n")
+                             : cat("static ", tn, " gs_lret_", id, "_", i, ";\n");
+        }
+        return id;
+    }
+    string Channel(int id, size_t i) { return msl() ? cat("gs.lret_", id, "_", i) : cat("gs_lret_", id, "_", i); }
+
+    // What the function being emitted returns when it only passes a
+    // long-distance return on: anything of its type.
+    string Placeholder() {
+        auto sp = fs->spec;
+        if (sp->rets.empty() || (sp == entry && entry->sf->gpustage == GPU_COMPUTE)) return "return;";
+        if (sp->rets.size() > 1) return cat("return ", ZeroOf(nullptr, sp->sf->line, RetStruct(sp->rets, sp->sf->line)), ";");
+        return cat("return ", ZeroOf(sp->rets[0], sp->sf->line), ";");
+    }
+
+    // After a call that can carry a long-distance return: caught where this
+    // function is its target, passed on otherwise.
+    void FromCheck(FnSpec *callee, Line l) {
+        if (callee->needs.empty()) return;
+        L(cat("if (", Rf(), " != 0u) {"));
+        fs->ind++;
+        if (callee->needs.count(fs->spec)) {
+            auto id = FromId(fs->spec, l);
+            L(cat("if (", Rf(), " == ", id, "u) {"));
+            fs->ind++;
+            L(cat(Rf(), " = 0u;"));
+            auto sp = fs->spec;
+            if (sp->rets.empty() || (sp == entry && entry->sf->gpustage == GPU_COMPUTE)) {
+                L("return;");
+            } else if (sp->rets.size() == 1) {
+                L(cat("return ", Channel(id, 0), ";"));
+            } else {
+                auto t = Temp();
+                L(cat(RetStruct(sp->rets, l), " ", t, ";"));
+                for (size_t i = 0; i < sp->rets.size(); i++) L(cat(t, ".r", i, " = ", Channel(id, i), ";"));
+                L(cat("return ", t, ";"));
+            }
+            fs->ind--;
+            L("}");
+        }
+        L(Placeholder());
+        fs->ind--;
+        L("}");
+    }
+
     // A fixed array, as a struct around a C array in both dialects: a value
     // that copies, passes and returns as Goose's does, which a bare array
     // does in neither. Its elements take their form in memory, MSL's packed
@@ -932,8 +1008,8 @@ struct GpuEmitter {
 
     // The default value of a type, which default<T>() and an omitted field
     // build.
-    string ZeroOf(TypeExpr *t, Line l) {
-        auto tn = TypeName(t, l);
+    string ZeroOf(TypeExpr *t, Line l, const string &named = "") {
+        auto tn = named.empty() ? TypeName(t, l) : named;
         return hlsl() ? cat("((", tn, ")0)") : cat(tn, "{}");
     }
 
@@ -1067,13 +1143,15 @@ struct GpuEmitter {
         if (sp->rets.empty()) {
             L(r + ";");
             for (auto &[lv, t] : writebacks) L(cat(lv, " = ", t, ";"));
+            FromCheck(sp, c->line);
             return "";
         }
-        if (writebacks.empty()) return r;
+        if (writebacks.empty() && sp->needs.empty()) return r;
         auto res = Temp();
         L(cat(sp->rets.size() > 1 ? RetStruct(sp->rets, c->line) : TypeName(sp->rets[0], c->line), " ",
               res, " = ", r, ";"));
         for (auto &[lv, t] : writebacks) L(cat(lv, " = ", t, ";"));
+        FromCheck(sp, c->line);
         return res;
     }
 
@@ -1226,7 +1304,7 @@ struct GpuEmitter {
             case NK_IfExpr: {
                 auto i = (IfExpr *)n;
                 auto c = X(i->cond);
-                L(cat("if (", c, ") {"));
+                L(cat("if (", Bare(c), ") {"));
                 fs->ind++;
                 Into(i->thenb, dst);
                 fs->ind--;
@@ -1358,7 +1436,7 @@ struct GpuEmitter {
             case NK_IfExpr: {
                 auto i = (IfExpr *)n;
                 auto c = X(i->cond);
-                L(cat("if (", c, ") {"));
+                L(cat("if (", Bare(c), ") {"));
                 fs->ind++;
                 Stmt(i->thenb);
                 fs->ind--;
@@ -1382,7 +1460,7 @@ struct GpuEmitter {
                 fs->out = saved;
                 fs->breakdsts.push_back("");
                 if (pre.empty()) {
-                    L(cat("while (", c, ") {"));
+                    L(cat("while (", Bare(c), ") {"));
                     fs->ind++;
                 } else {
                     L("while (true) {");
@@ -1443,8 +1521,17 @@ struct GpuEmitter {
                     EntryReturn(r->vals, n->line);
                     return;
                 }
-                if (r->target && r->target != fs->spec->sf)
-                    Fail(n, "`return ... from` does not run on the GPU");
+                if (r->target && r->target != fs->spec->sf) {
+                    auto t = r->targetspec;
+                    if (!t) Fail(n, "internal: a long-distance return without its target");
+                    auto id = FromId(t, n->line);
+                    for (size_t i = 0; i < r->vals.size(); i++)
+                        L(cat(Channel(id, i), " = ",
+                              Convert(X(r->vals[i]), r->vals[i]->exprtype, t->rets[i], n->line), ";"));
+                    L(cat(Rf(), " = ", id, "u;"));
+                    L(Placeholder());
+                    return;
+                }
                 if (r->vals.empty()) {
                     L("return;");
                     return;
@@ -2099,6 +2186,7 @@ struct GpuEmitter {
             out += decls;
             out += tabledefs;
             for (auto &[n, t] : shared) out += cat("groupshared ", t, " ", n, ";\n");
+            if (usesrf) out += cat("static uint gs_rf;\n", rfdecls);
             out += "\nstatic uint3 gs_dispatch_thread_id;\nstatic uint3 gs_group_id;\n"
                    "static uint3 gs_group_thread_id;\nstatic uint gs_group_index;\n"
                    "static uint gs_vertex_index;\nstatic uint gs_instance_index;\n"
@@ -2121,6 +2209,7 @@ struct GpuEmitter {
                 setup = "    gs_frag_coord = gs_in.position;\n"
                         "    gs_front_facing = gs_in.front_facing;\n";
             }
+            if (usesrf) setup += "    gs_rf = 0u;\n";
             out += cat(ret, " ", name, "(", sig, ")",
                        stage == GPU_FRAGMENT && entry->rets.size() == 1 ? " : SV_Target0" : "",
                        " {\n", setup, st.out, "}\n");
@@ -2138,6 +2227,7 @@ struct GpuEmitter {
                    "    float4 frag_coord;\n    bool front_facing;\n    uint simd_lane;\n"
                    "    uint simd_size;\n";
             for (auto &[n, t] : shared) out += cat("    threadgroup ", t, " *", n, ";\n");
+            if (usesrf) out += cat("    uint rf;\n", rfdecls);
             out += "};\n\n";
             out += tabledefs;
             out += helperdefs;
@@ -2177,6 +2267,7 @@ struct GpuEmitter {
                           "uint gs_ss [[threads_per_simdgroup]]";
                 setup += "    gs.simd_lane = gs_sl;\n    gs.simd_size = gs_ss;\n";
             }
+            if (usesrf) setup += "    gs.rf = 0u;\n";
             out += cat(kind, " ", ret, " ", name, "(", params, ") {\n", setup, st.out, "}\n");
         }
         return out;

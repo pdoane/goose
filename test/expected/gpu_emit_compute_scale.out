@@ -68,7 +68,7 @@ void scale_kernel(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint
 #line 16 "compute_scale.goose"
     const uint i = gs_dispatch_thread_id.x;
 #line 17 "compute_scale.goose"
-    if ((i >= p.n)) {
+    if (i >= p.n) {
 #line 17 "compute_scale.goose"
         return;
     }
@@ -149,7 +149,7 @@ kernel void scale_kernel(constant Push &gs_push [[buffer(0)]], device const ulon
 #line 16 "compute_scale.goose"
     const uint i = gs.dispatch_thread_id.x;
 #line 17 "compute_scale.goose"
-    if ((i >= p.n)) {
+    if (i >= p.n) {
 #line 17 "compute_scale.goose"
         return;
     }
@@ -223,7 +223,7 @@ void scale_kernel(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint
 #line 16 "compute_scale.goose"
     const uint i = gs_dispatch_thread_id.x;
 #line 17 "compute_scale.goose"
-    if ((i >= p.n)) {
+    if (i >= p.n) {
 #line 17 "compute_scale.goose"
         return;
     }

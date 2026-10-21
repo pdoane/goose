@@ -83,7 +83,7 @@ float4 mesh_fs(gs_fragment_in gs_in) : SV_Target0 {
     f.uv = gs_in.uv;
     f.id = gs_in.id;
 #line 19 "raster_textured.goose"
-    if ((f.id > 100u)) {
+    if (f.id > 100u) {
 #line 19 "raster_textured.goose"
         discard;
     }
@@ -177,7 +177,7 @@ fragment float4 mesh_fs(gs_fragment_in gs_in [[stage_in]], bool ff [[front_facin
     f.uv = gs_in.uv;
     f.id = gs_in.id;
 #line 19 "raster_textured.goose"
-    if ((f.id > 100u)) {
+    if (f.id > 100u) {
 #line 19 "raster_textured.goose"
         discard_fragment();
     }
@@ -262,7 +262,7 @@ float4 mesh_fs(gs_fragment_in gs_in) : SV_Target0 {
     f.uv = gs_in.uv;
     f.id = gs_in.id;
 #line 19 "raster_textured.goose"
-    if ((f.id > 100u)) {
+    if (f.id > 100u) {
 #line 19 "raster_textured.goose"
         discard;
     }
