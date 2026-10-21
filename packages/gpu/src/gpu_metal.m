@@ -100,6 +100,14 @@ static MTLPixelFormat mtl_format(int f) {
         case GOOSE_GPU_DEPTH24: case GOOSE_GPU_DEPTH32F: case GOOSE_GPU_DEPTH:
             return MTLPixelFormatDepth32Float;
         case GOOSE_GPU_DEPTH24_STENCIL8: return MTLPixelFormatDepth32Float_Stencil8;
+        case GOOSE_GPU_BC1: return MTLPixelFormatBC1_RGBA;
+        case GOOSE_GPU_BC1_SRGB: return MTLPixelFormatBC1_RGBA_sRGB;
+        case GOOSE_GPU_BC3: return MTLPixelFormatBC3_RGBA;
+        case GOOSE_GPU_BC3_SRGB: return MTLPixelFormatBC3_RGBA_sRGB;
+        case GOOSE_GPU_BC4: return MTLPixelFormatBC4_RUnorm;
+        case GOOSE_GPU_BC5: return MTLPixelFormatBC5_RGUnorm;
+        case GOOSE_GPU_BC7: return MTLPixelFormatBC7_RGBAUnorm;
+        case GOOSE_GPU_BC7_SRGB: return MTLPixelFormatBC7_RGBAUnorm_sRGB;
         default: return MTLPixelFormatInvalid;
     }
 }
@@ -425,11 +433,11 @@ static int mtl_update_texture(uint32_t slot, int access, const void *data, int64
     id<MTLTexture> t = textures[slot];
     const goose_gpu_tex *gt = goose_gpu_texture_of(slot);
     const goose_gpu_texture_desc *d = &gt->desc;
-    NSUInteger row = (NSUInteger)d->width * (NSUInteger)goose_gpu_texel_size(d->format);
+    NSUInteger row = (NSUInteger)goose_gpu_row_bytes(d->format, d->width);
     [uploadenc copyFromBuffer:staging
                  sourceOffset:0
             sourceBytesPerRow:row
-          sourceBytesPerImage:row * (NSUInteger)d->height
+          sourceBytesPerImage:row * (NSUInteger)goose_gpu_rows(d->format, d->height)
                    sourceSize:MTLSizeMake((NSUInteger)d->width, (NSUInteger)d->height, 1)
                     toTexture:t
              destinationSlice:0
@@ -937,7 +945,8 @@ static void *mtl_readback_texture(uint32_t slot, int access, int64_t size) {
     (void)access;
     id<MTLTexture> src = textures[slot];
     const goose_gpu_tex *t = goose_gpu_texture_of(slot);
-    NSUInteger row = (NSUInteger)t->desc.width * (NSUInteger)goose_gpu_texel_size(t->desc.format);
+    NSUInteger row = (NSUInteger)goose_gpu_row_bytes(t->desc.format, t->desc.width);
+    NSUInteger rows = (NSUInteger)goose_gpu_rows(t->desc.format, t->desc.height);
     return readback_into(^(id<MTL4ComputeCommandEncoder> e, id<MTLBuffer> dst) {
         [e copyFromTexture:src
                sourceSlice:0
@@ -947,8 +956,27 @@ static void *mtl_readback_texture(uint32_t slot, int access, int64_t size) {
                   toBuffer:dst
          destinationOffset:0
     destinationBytesPerRow:row
-  destinationBytesPerImage:row * src.height];
+  destinationBytesPerImage:row * rows];
     }, size);
+}
+
+static void mtl_copy_to_texture(uint32_t buf, int64_t offset, uint32_t slot) {
+    begin();
+    id<MTLTexture> t = textures[slot];
+    const goose_gpu_tex *gt = goose_gpu_texture_of(slot);
+    NSUInteger row = (NSUInteger)goose_gpu_row_bytes(gt->desc.format, gt->desc.width);
+    NSUInteger rows = (NSUInteger)goose_gpu_rows(gt->desc.format, gt->desc.height);
+    id<MTL4ComputeCommandEncoder> e = open_compute();
+    [e copyFromBuffer:buffers[buf]
+         sourceOffset:(NSUInteger)offset
+    sourceBytesPerRow:row
+  sourceBytesPerImage:row * rows
+           sourceSize:MTLSizeMake(t.width, t.height, 1)
+            toTexture:t
+     destinationSlice:0
+     destinationLevel:0
+    destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [e endEncoding];
 }
 
 static void mtl_readback_read(void *rb, void *out, int64_t size) {
@@ -1010,7 +1038,7 @@ const goose_gpu_backend goose_gpu_metal = {
     "metal",
     mtl_open, mtl_close,
     mtl_buffer_create, mtl_texture_create, mtl_release, mtl_update_buffer, mtl_update_texture,
-    mtl_generate_mips,
+    mtl_generate_mips, mtl_copy_to_texture,
     mtl_ray_query, mtl_accel_create, mtl_accel_build, mtl_accel_reference,
     mtl_compute_create, mtl_raster_create, mtl_pipeline_release,
     mtl_begin_compute, mtl_end_compute, mtl_begin_pass, mtl_end_pass,

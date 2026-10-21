@@ -37,6 +37,11 @@ let RGBA8UI: i32 = 13;         let RGB10A2: i32 = 14;        let RG11B10F: i32 =
 let DEPTH16: i32 = 16;         let DEPTH24: i32 = 17;        let DEPTH32F: i32 = 18;
 let DEPTH24_STENCIL8: i32 = 19;
 let DEPTH: i32 = 20;
+// Block-compressed: 4x4 texels to a block of 8 bytes (BC1, BC4) or 16, a
+// sampled texture of one mip, its size a multiple of 4.
+let BC1: i32 = 21;             let BC1_SRGB: i32 = 22;       let BC3: i32 = 23;
+let BC3_SRGB: i32 = 24;        let BC4: i32 = 25;            let BC5: i32 = 26;
+let BC7: i32 = 27;             let BC7_SRGB: i32 = 28;
 
 struct TextureDesc {
     kind: i32 = 0,          // TEXTURE_2D
@@ -159,6 +164,8 @@ extern "goose_gpu_draw_indexed" fn draw_indexed(indices: i64, instances: i64, fi
                                                 vertex_offset: i64, first_instance: i64);
 extern "goose_gpu_dispatch" fn dispatch(x: i64, y: i64, z: i64);
 extern "goose_gpu_barrier" fn barrier_native(index: u32, before: i64, after: i64);
+extern "goose_gpu_copy_to_texture" fn copy_to_texture_native(buffer: u32, offset: i64,
+                                                             texture: u32);
 extern "goose_gpu_ray_query" fn ray_query() -> bool;
 extern "goose_gpu_primitive_accel" fn primitive_accel_native(desc: PrimitiveAccelDesc) -> u32;
 extern "goose_gpu_instance_accel" fn instance_accel_native(desc: InstanceAccelDesc) -> u32;
@@ -355,6 +362,15 @@ fn draw_indexed_instanced(indices: i64, instances: i64) { draw_indexed(indices, 
 // `after`, and t's layout changed to suit: between passes, never in one.
 fn barrier(t: Texture, before: i64, after: i64) { barrier_native(t.index, before, after); }
 fn barrier(b: Buffer, before: i64, after: i64) { barrier_native(b.index, before, after); }
+
+// A copy of b's bytes from `offset` into t's mip 0, laid out as an upload's
+// are (rows of blocks for a compressed format), where the work is recorded:
+// outside passes, b made visible to copies (ACCESS_COPY_SRC) and t left in
+// ACCESS_COPY_DST by barriers before it. How a shader's output becomes a
+// texture it could not write, a compressed one among them.
+fn copy_to_texture(b: Buffer, offset: i64, t: Texture) {
+    copy_to_texture_native(b.index, offset, t.index);
+}
 
 // Ray tracing (docs/design/gpu.md §7), where ray_query() says the device has
 // it. A primitive acceleration structure holds triangles, positions

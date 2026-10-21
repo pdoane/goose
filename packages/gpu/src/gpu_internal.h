@@ -29,7 +29,11 @@ enum {
     GOOSE_GPU_RGBA16F, GOOSE_GPU_RGBA32F, GOOSE_GPU_R16F, GOOSE_GPU_RG16F, GOOSE_GPU_R32F,
     GOOSE_GPU_RG32F, GOOSE_GPU_R32UI, GOOSE_GPU_RGBA8UI, GOOSE_GPU_RGB10A2, GOOSE_GPU_RG11B10F,
     GOOSE_GPU_DEPTH16, GOOSE_GPU_DEPTH24, GOOSE_GPU_DEPTH32F, GOOSE_GPU_DEPTH24_STENCIL8,
-    GOOSE_GPU_DEPTH, GOOSE_GPU_FORMAT_END,
+    GOOSE_GPU_DEPTH,
+    /* Block-compressed, 4x4 texels to a block of 8 or 16 bytes. */
+    GOOSE_GPU_BC1, GOOSE_GPU_BC1_SRGB, GOOSE_GPU_BC3, GOOSE_GPU_BC3_SRGB, GOOSE_GPU_BC4,
+    GOOSE_GPU_BC5, GOOSE_GPU_BC7, GOOSE_GPU_BC7_SRGB,
+    GOOSE_GPU_FORMAT_END,
 };
 enum { GOOSE_GPU_SAMPLED = 1, GOOSE_GPU_COLOR_TARGET = 2, GOOSE_GPU_DEPTH_TARGET = 4,
        GOOSE_GPU_STORAGE = 8 };
@@ -160,6 +164,11 @@ typedef struct goose_gpu_backend {
        texture's); else where the program's work is being recorded, outside
        passes. */
     int (*generate_mips)(uint32_t slot, int access, int upload);
+    /* A copy of a buffer's bytes from `offset` into a texture's mip 0, laid
+       out as an upload's are, where the program's work is recorded: the
+       buffer made visible to copies and the texture left in
+       GOOSE_GPU_ACCESS_COPY_DST by the program's barriers. */
+    void (*copy_to_texture)(uint32_t buffer, int64_t offset, uint32_t texture);
     /* Ray tracing (§7): whether the device has ray queries, and
        acceleration structures in heap slots, sized for their description
        (one of `prim` and `inst`) and built when asked, in order with the
@@ -216,8 +225,17 @@ enum { GOOSE_GPU_KIND_BUFFER, GOOSE_GPU_KIND_TEXTURE, GOOSE_GPU_KIND_ACCEL };
 
 /* The texture in a slot, for the backends; null for none. */
 const goose_gpu_tex *goose_gpu_texture_of(uint32_t slot);
-/* Bytes per texel of a format; 0 for a depth format the CPU does not read. */
+/* Bytes per texel of a format; 0 for a depth format the CPU does not read,
+   and for a compressed one. */
 int goose_gpu_texel_size(int format);
+/* Bytes per 4x4 block of a compressed format; 0 for any other. */
+int goose_gpu_block_size(int format);
+/* The bytes of a row of mip 0 as the CPU lays it out, a row of blocks for
+   a compressed format, and the number of such rows; 0 for a format the CPU
+   does not read or write. */
+int64_t goose_gpu_row_bytes(int format, int width);
+int goose_gpu_rows(int format, int height);
+int64_t goose_gpu_mip0_bytes(const goose_gpu_texture_desc *d);
 int goose_gpu_is_depth(int format);
 /* Whether mips of the format can be made by filtering: color, not
    integer. */

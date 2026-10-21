@@ -106,8 +106,32 @@ int goose_gpu_is_depth(int format) {
 }
 
 int goose_gpu_filters(int format) {
-    return !goose_gpu_is_depth(format) && format != GOOSE_GPU_R32UI &&
-           format != GOOSE_GPU_RGBA8UI;
+    return !goose_gpu_is_depth(format) && !goose_gpu_block_size(format) &&
+           format != GOOSE_GPU_R32UI && format != GOOSE_GPU_RGBA8UI;
+}
+
+int goose_gpu_block_size(int format) {
+    switch (format) {
+        case GOOSE_GPU_BC1: case GOOSE_GPU_BC1_SRGB: case GOOSE_GPU_BC4: return 8;
+        case GOOSE_GPU_BC3: case GOOSE_GPU_BC3_SRGB: case GOOSE_GPU_BC5: case GOOSE_GPU_BC7:
+        case GOOSE_GPU_BC7_SRGB:
+            return 16;
+        default: return 0;
+    }
+}
+
+int64_t goose_gpu_row_bytes(int format, int width) {
+    int block = goose_gpu_block_size(format);
+    if (block) return (int64_t)((width + 3) / 4) * block;
+    return (int64_t)width * goose_gpu_texel_size(format);
+}
+
+int goose_gpu_rows(int format, int height) {
+    return goose_gpu_block_size(format) ? (height + 3) / 4 : height;
+}
+
+int64_t goose_gpu_mip0_bytes(const goose_gpu_texture_desc *d) {
+    return goose_gpu_row_bytes(d->format, d->width) * goose_gpu_rows(d->format, d->height);
 }
 
 int goose_gpu_texel_size(int format) {
@@ -376,8 +400,14 @@ uint32_t goose_gpu_texture(goose_gpu_texture_desc d, goose_gpu_bytes data) {
     }
     if (d.samples < 1) d.samples = 1;
     if (d.depth < 1) d.depth = 1;
+    if (goose_gpu_block_size(d.format) &&
+        (d.width % 4 || d.height % 4 || (d.usage & ~GOOSE_GPU_SAMPLED) || d.mips > 1)) {
+        goose_gpu_misuse("gpu::texture of compressed format %d, %dx%d: a sampled texture of one "
+                         "mip, its size a multiple of 4", d.format, d.width, d.height);
+        return 0;
+    }
     if (data.len) {
-        int64_t want = (int64_t)d.width * d.height * goose_gpu_texel_size(d.format);
+        int64_t want = goose_gpu_mip0_bytes(&d);
         if (!want || data.len != want) {
             goose_gpu_misuse("gpu::texture with %lld bytes, where its mip 0 is %lld",
                              (long long)data.len, (long long)want);
@@ -416,8 +446,7 @@ uint8_t goose_gpu_update_texture(uint32_t slot, goose_gpu_bytes data) {
     if (!ready("gpu::update_texture")) return 0;
     goose_gpu_tex *t = slot < GOOSE_GPU_HEAP_SLOTS && slotkind[slot] == SLOT_TEXTURE
                            ? &textures[slot] : NULL;
-    int64_t want = t ? (int64_t)t->desc.width * t->desc.height * goose_gpu_texel_size(t->desc.format)
-                     : 0;
+    int64_t want = t ? goose_gpu_mip0_bytes(&t->desc) : 0;
     if (!t || !want || data.len != want || slot == screenslot) {
         goose_gpu_misuse("gpu::update_texture of %u with %lld bytes: a texture's whole mip 0, "
                          "of a format the CPU writes", slot, (long long)data.len);
@@ -906,6 +935,24 @@ void goose_gpu_draw_indexed(int64_t indices, int64_t instances, int64_t first, i
     draw(1, indices, instances, first, offset, first_instance);
 }
 
+void goose_gpu_copy_to_texture(uint32_t buf, int64_t offset, uint32_t slot) {
+    if (!ready("gpu::copy_to_texture") || !outside_pass("gpu::copy_to_texture")) return;
+    const goose_gpu_tex *t = goose_gpu_texture_of(slot);
+    int64_t size = t ? goose_gpu_mip0_bytes(&t->desc) : 0;
+    if (!buffer_slot(buf) || !size || offset < 0 || offset + size > slotsize[buf]) {
+        goose_gpu_misuse("gpu::copy_to_texture of buffer %u from %lld into %u: a buffer holding "
+                         "the texture's mip 0, of a format the CPU lays out", buf,
+                         (long long)offset, slot);
+        return;
+    }
+    if (t->access != GOOSE_GPU_ACCESS_COPY_DST) {
+        goose_gpu_misuse("gpu::copy_to_texture into texture %u, left in access %d: a gpu::barrier "
+                         "to ACCESS_COPY_DST goes first", slot, t->access);
+        return;
+    }
+    backend->copy_to_texture(buf, offset, slot);
+}
+
 void goose_gpu_barrier(uint32_t slot, int64_t before, int64_t after) {
     if (!ready("gpu::barrier") || !outside_pass("gpu::barrier")) return;
     goose_gpu_tex *t = slot < GOOSE_GPU_HEAP_SLOTS && slotkind[slot] == SLOT_TEXTURE
@@ -1141,12 +1188,12 @@ uint32_t goose_gpu_read_buffer(uint32_t slot, int64_t offset, int64_t size) {
 uint32_t goose_gpu_read_texture(uint32_t slot) {
     if (!ready("gpu::read_texture") || !outside_pass("gpu::read_texture")) return 0;
     const goose_gpu_tex *t = goose_gpu_texture_of(slot);
-    if (!t || !goose_gpu_texel_size(t->desc.format) || t->access == GOOSE_GPU_ACCESS_NONE) {
+    if (!t || !goose_gpu_mip0_bytes(&t->desc) || t->access == GOOSE_GPU_ACCESS_NONE) {
         goose_gpu_misuse("gpu::read_texture of %u: a texture with contents, of a format the "
                          "CPU reads", slot);
         return 0;
     }
-    int64_t size = (int64_t)t->desc.width * t->desc.height * goose_gpu_texel_size(t->desc.format);
+    int64_t size = goose_gpu_mip0_bytes(&t->desc);
     return new_readback(backend->readback_texture(slot, t->access, size), size);
 }
 

@@ -169,7 +169,14 @@ fn release(b: Buffer)                                    // and every other kind
 ```
 
 `TextureDesc`, `SamplerDesc` and `Region` are `gfx`'s structs, with its
-kinds, formats, filters and wraps. Buffer usage is what a shader may do:
+kinds, formats, filters and wraps, and block-compressed formats besides
+(`BC1`, `BC3`, `BC4`, `BC5`, `BC7`, and sRGB forms of 1, 3 and 7): a
+sampled texture of one mip, its size a multiple of 4, whose bytes are rows
+of blocks wherever a texture's bytes are given or read. A shader writes no
+compressed texture, so `copy_to_texture(b, offset, t)` copies a buffer's
+bytes into a texture's mip 0, in the program's work after a barrier into
+`ACCESS_COPY_SRC` for the buffer and `ACCESS_COPY_DST` for the texture:
+what a GPU encoder needs. Buffer usage is what a shader may do:
 `BUFFER_READ`, `BUFFER_WRITE`, `BUFFER_INDEX`, `BUFFER_INDIRECT` and
 `BUFFER_ACCEL_INPUT` (§7). `gfx`'s `BUFFER_VERTEX` has no counterpart,
 since vertices are a buffer a vertex shader reads.
@@ -894,6 +901,16 @@ Each phase lands as working commits with its tests.
    mips filled in its upload. Left of phase 2: command buffers for other
    threads, the stream buffer, faults (§5.6) and timestamps. `f16` (§5.8)
    is deferred, and stays designed here.
+
+   Fixed arrays run on the GPU as §5.2 says: in both dialects a struct
+   around a C array, so that one copies, passes and returns as Goose's
+   does, with MSL's packed vectors as its elements. A global array of
+   literals is a table, emitted once as a constant (`static const`,
+   `constant`). `packages/gpu/examples/bc` encodes BC1, BC3, BC4, BC5 and
+   BC7 (modes 1 and 6) on the GPU with Goose functions that make every
+   decision in integers, and checks that the CPU, running the same
+   functions, makes the same bits for every block, and that its decoder
+   agrees with the GPU's, on both backends.
 3. **Direct3D 12.** By this point the HLSL emitter and the ABI have been
    exercised through Vulkan, so this is mostly the backend.
 4. **Ray tracing**, on Metal and Direct3D 12: acceleration structures, the

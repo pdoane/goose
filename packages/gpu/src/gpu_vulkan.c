@@ -193,6 +193,14 @@ static VkFormat vk_format(int f) {
         case GOOSE_GPU_DEPTH24: case GOOSE_GPU_DEPTH32F: case GOOSE_GPU_DEPTH:
             return VK_FORMAT_D32_SFLOAT;
         case GOOSE_GPU_DEPTH24_STENCIL8: return VK_FORMAT_D32_SFLOAT_S8_UINT;
+        case GOOSE_GPU_BC1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case GOOSE_GPU_BC1_SRGB: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+        case GOOSE_GPU_BC3: return VK_FORMAT_BC3_UNORM_BLOCK;
+        case GOOSE_GPU_BC3_SRGB: return VK_FORMAT_BC3_SRGB_BLOCK;
+        case GOOSE_GPU_BC4: return VK_FORMAT_BC4_UNORM_BLOCK;
+        case GOOSE_GPU_BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
+        case GOOSE_GPU_BC7: return VK_FORMAT_BC7_UNORM_BLOCK;
+        case GOOSE_GPU_BC7_SRGB: return VK_FORMAT_BC7_SRGB_BLOCK;
         default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -555,6 +563,7 @@ static int vk_open(void *window, int vsync) {
     w2.features.vertexPipelineStoresAndAtomics = f2.features.vertexPipelineStoresAndAtomics;
     w2.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics;
     w2.features.samplerAnisotropy = f2.features.samplerAnisotropy;
+    w2.features.textureCompressionBC = f2.features.textureCompressionBC;
     w2.features.shaderStorageImageReadWithoutFormat = f2.features.shaderStorageImageReadWithoutFormat;
     w2.features.shaderStorageImageWriteWithoutFormat = f2.features.shaderStorageImageWriteWithoutFormat;
     const char *exts[] = { VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME,
@@ -1061,6 +1070,18 @@ static int vk_generate_mips(uint32_t slot, int access, int upload) {
     return 1;
 }
 
+static void vk_copy_to_texture(uint32_t buf, int64_t offset, uint32_t slot) {
+    if (!begin()) return;
+    vkimage *im = &images[slot];
+    const goose_gpu_tex *t = goose_gpu_texture_of(slot);
+    VkBufferImageCopy region = { 0 };
+    region.bufferOffset = (VkDeviceSize)offset;
+    region.imageSubresource = (VkImageSubresourceLayers) { im->aspect, 0, 0, 1 };
+    region.imageExtent = (VkExtent3D) { (uint32_t)t->desc.width, (uint32_t)t->desc.height, 1 };
+    vkCmdCopyBufferToImage(cmd, buffers[buf].buffer, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &region);
+}
+
 /* KosmicKrisp has no ray queries yet; VK_KHR_ray_query comes with a device
    that does (docs/design/gpu.md §7). */
 static int vk_ray_query(void) { return 0; }
@@ -1517,7 +1538,7 @@ const goose_gpu_backend goose_gpu_vulkan = {
     "vulkan",
     vk_open, vk_close,
     vk_buffer_create, vk_texture_create, vk_release, vk_update_buffer, vk_update_texture,
-    vk_generate_mips,
+    vk_generate_mips, vk_copy_to_texture,
     vk_ray_query, vk_accel_create, vk_accel_build, vk_accel_reference,
     vk_compute_create, vk_raster_create, vk_pipeline_release,
     vk_begin_compute, vk_end_compute, vk_begin_pass, vk_end_pass,
