@@ -142,6 +142,24 @@ fn trimmed(i: u32) -> u32 {
     total
 }
 
+// const for: a blend of every field of a struct, by field, whatever the
+// struct, and a sum of a variant's index over every variant.
+struct Light { color: float3, power: f32, radius: f32 }
+
+fn blend_fields<T>(a: T, b: T, t: f32) -> T {
+    T { const for <N, F> in fields<T> { F: a.F + (b.F - a.F) * t, } }
+}
+
+fn variant_rank(s: Shape) -> u32 {
+    var rank: u32 = 0;
+    var k: u32 = 0;
+    const for <N, V> in variants<Shape> {
+        k += 1;
+        match s { V => { rank = k; }, _ => {} }
+    }
+    rank
+}
+
 struct Result {
     pos: float3,
     hits: u32,
@@ -161,6 +179,8 @@ struct Result {
     big: u32,
     walked: u32,
     trimmed: u32,
+    blended: f32,
+    rank: u32,
 }
 
 fn list_of(i: u32) -> u32[..4] {
@@ -173,6 +193,13 @@ fn sum_list(xs: u32[..4]) -> u32 {
     var s: u32 = xs.len as u32 * 100;
     for x in xs { s += x; }
     s
+}
+
+fn blend(i: u32) -> f32 {
+    let a = Light { color: float3 { 1.0, 0.5, 0.25 }, power: 2.0, radius: 1.0 };
+    let b = Light { color: float3 { 0.0, 1.0, 0.5 }, power: 6.0, radius: 3.0 };
+    let m = blend_fields(a, b, (i % 5) * 0.25);
+    m.color.x + m.color.y * 2.0 + m.power * 3.0 + m.radius * 4.0
 }
 
 fn work(i: u32, stored: Shape, list: u32[..4]) -> Result {
@@ -195,7 +222,8 @@ fn work(i: u32, stored: Shape, list: u32[..4]) -> Result {
     Result { pos: b.pos, hits: b.hits, energy: energy(b), q: q, r: r, lo: lo, hi: hi, sorted: xs,
              flipped: if flipped { 1 } else { 0 }, a: o.a, found: found, area: area(shape_of(i)),
              stored: area(stored), corners: corners(shape_of(i)) + corners(stored), bucket: bucket(i),
-             big: first_big(table), walked: walk(i % 3, 20 + i % 13), trimmed: trimmed(i) + sum_list(list) }
+             big: first_big(table), walked: walk(i % 3, 20 + i % 13), trimmed: trimmed(i) + sum_list(list),
+             blended: blend(i), rank: variant_rank(shape_of(i)) }
 }
 
 struct Push {
@@ -247,7 +275,8 @@ fn main() {
            g.hi != want.hi || g.sorted != want.sorted || g.flipped != want.flipped || g.a != want.a ||
            g.found != want.found || abs(g.area - want.area) > 1e-3 || abs(g.stored - want.stored) > 1e-3 ||
            g.corners != want.corners || g.bucket != want.bucket || g.big != want.big ||
-           g.walked != want.walked || g.trimmed != want.trimmed {
+           g.walked != want.walked || g.trimmed != want.trimmed || abs(g.blended - want.blended) > 1e-4 ||
+           g.rank != want.rank {
             if wrong < 4 {
                 print("invocation ", i, ": hits ", g.hits, "/", want.hits, " q ", g.q, "/", want.q, " lo ", g.lo,
                       "/", want.lo, " sorted ", g.sorted[0], ",", g.sorted[1], ",", g.sorted[2], ",", g.sorted[3],

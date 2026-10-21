@@ -67,7 +67,7 @@ case functions, with ADTs read from buffers in Goose's packed layout (§5);
 faults (§6), with `packages/gpu/test/faults.goose` triggering each kind;
 limited arrays (§7), read from buffers as Goose packs them; global arrays
 uploaded as buffers (§10) and references into them, self-relative and `in
-pool` (§9). `packages/gpu/examples/gltf/bvh.goose` builds a BVH over a
+pool` (§9); and `const for` (§11). `packages/gpu/examples/gltf/bvh.goose` builds a BVH over a
 glTF model on the CPU, linked by self-relative references, uploads it byte
 for byte, and traces it with one function on the CPU and the GPU: every
 sampled pixel agrees with the CPU, and all but one of 691,200 with Metal's
@@ -298,8 +298,10 @@ or a device loss.
 ## 11. `const for`
 
 Expansion over a struct's fields or an ADT's variants happens in the
-checker, before the emitter sees the function (§6.5), so it should run on
-the GPU as soon as what it expands to does. It is the way to derive what
+checker, before the emitter sees the function (§6.5), so it runs on the GPU
+wherever what it expands to does: the language test blends every field of
+a struct generically and matches over every variant of an ADT, with no
+change to the emitter. It is the way to derive what
 shader code otherwise writes by hand per struct: interpolating every field
 of a varyings struct, packing a struct into fewer words, converting
 between array-of-structs and struct-of-arrays layouts
