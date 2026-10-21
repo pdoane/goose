@@ -24,6 +24,11 @@ static int64_t accelmax[GOOSE_GPU_HEAP_SLOTS];
 static uint8_t slotkind[GOOSE_GPU_HEAP_SLOTS];
 static int64_t slotsize[GOOSE_GPU_HEAP_SLOTS];
 static goose_gpu_tex textures[GOOSE_GPU_HEAP_SLOTS];
+/* Slots released while work that may use them is recorded or in flight:
+   RELEASE_PENDING until the next submission, then its fence, past which
+   the backend releases them (§2, deferred destruction). */
+#define RELEASE_PENDING UINT64_MAX
+static uint64_t dying[GOOSE_GPU_HEAP_SLOTS];
 
 static goose_gpu_pipe pipelines[GOOSE_GPU_MAX_PIPELINES];
 
@@ -337,6 +342,7 @@ void goose_gpu_close(void) {
         if (slotkind[s]) {
             backend->release(s, slotkind[s] - SLOT_BUFFER);
             slotkind[s] = SLOT_FREE;
+            dying[s] = 0;
         }
     backend->close();
     backend = NULL;
@@ -573,12 +579,8 @@ uint32_t goose_gpu_image_texture(goose_gpu_bytes data, int64_t flags) {
 #endif
 }
 
-void goose_gpu_release(uint32_t slot) {
-    if (!backend || !slot) return;
-    if (slot >= GOOSE_GPU_HEAP_SLOTS || !slotkind[slot] || slotkind[slot] == SLOT_VIEW) {
-        goose_gpu_misuse("gpu::release of %u, which is no buffer or texture", slot);
-        return;
-    }
+/* Releases a slot now: its views, then what it holds. */
+static void release_now(uint32_t slot) {
     if (slotkind[slot] == SLOT_TEXTURE)
         for (int m = 0; m < 16; m++) {
             uint32_t v = textures[slot].views[m];
@@ -589,6 +591,33 @@ void goose_gpu_release(uint32_t slot) {
         }
     backend->release(slot, slotkind[slot] - SLOT_BUFFER);
     slotkind[slot] = SLOT_FREE;
+    dying[slot] = 0;
+}
+
+/* Released at once as far as the program is concerned, and for the GPU
+   once the work recorded so far has completed. */
+void goose_gpu_release(uint32_t slot) {
+    if (!backend || !slot) return;
+    if (slot >= GOOSE_GPU_HEAP_SLOTS || !slotkind[slot] || slotkind[slot] == SLOT_VIEW || dying[slot]) {
+        goose_gpu_misuse("gpu::release of %u, which is no buffer or texture", slot);
+        return;
+    }
+    dying[slot] = RELEASE_PENDING;
+}
+
+/* The slots whose work is done, released; with `fence`, those released
+   since the last submission are carried by it. */
+static void reap(uint64_t fence) {
+    if (!backend) return;
+    uint64_t done = backend->completed();
+    for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++) {
+        if (!dying[s]) continue;
+        if (dying[s] == RELEASE_PENDING) {
+            if (fence) dying[s] = fence;
+            continue;
+        }
+        if (dying[s] <= done) release_now(s);
+    }
 }
 
 /* The slot shaders write mip `mip` of a storage texture through (§3): the
@@ -1050,6 +1079,7 @@ uint64_t goose_gpu_submit(void) {
     uint64_t f = backend->submit(0);
     note_submitted();
     note_readbacks(f);
+    reap(f);
     write_pngs();
     return f;
 }
@@ -1150,8 +1180,10 @@ uint8_t goose_gpu_frame(void) {
     uint64_t f = backend->submit(present);
     note_submitted();
     note_readbacks(f);
+    reap(f);
     screenacquired = 0;
     if (f > 2) backend->wait(f - 2);
+    reap(0);
     write_pngs();
     poll_events();
     framecount++;
@@ -1215,12 +1247,14 @@ void goose_gpu_set_title(goose_gpu_bytes title) {
 }
 
 uint8_t goose_gpu_fence_done(uint64_t f) {
+    reap(0);
     write_pngs();
     return backend && backend->completed() >= f;
 }
 
 void goose_gpu_wait(uint64_t f) {
     if (backend) backend->wait(f);
+    reap(0);
     write_pngs();
     goose_gpu_check();
 }
