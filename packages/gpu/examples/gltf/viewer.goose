@@ -6,7 +6,7 @@
 // Drag with the mouse, or use the arrow keys, to turn around the model;
 // W and S move in and out; P saves a screenshot; Escape quits.
 //
-//   goose viewer.goose -- [model.glb] [--hdr sky.hdr] [--yaw r --pitch r]
+//   goose viewer.goose -- [model.glb] [--hdr sky.hdr] [--yaw r --pitch r --zoom k]
 //                          [--frames N --out shot.png]
 //
 // Without a model it shows DamagedHelmet from ~/.goose/assets, which
@@ -107,7 +107,20 @@ fragment fn mesh_fs(v: Varyings, p: Push, f: const Frame&) -> float4 {
     let ab = xyz(gpu::sample_level(f.lut, gpu::LINEAR_CLAMP, float2 { nv, s.roughness }, 0.0));
     let r = n * (2.0 * dot(n, view)) - view;
     let spec = env_lookup(f.specular, r, s.roughness * (f.spec_mips - 1.0)) * (f0 * ab.x + float3_1 * ab.y);
-    let diffuse = env_lookup(f.irradiance, n, 0.0) * s.base * (1.0 - s.metallic);
+    var diffuse = env_lookup(f.irradiance, n, 0.0) * s.base * (1.0 - s.metallic);
+    // Transmission, roughly: the environment through a refraction, tinted
+    // and absorbed over a thickness the raster has no way to know, in place
+    // of the diffuse light it replaces (the path tracer does it properly).
+    if m.transmission > 0.0 {
+        let eta = 1.0 / m.ior;
+        let cosi = nv;
+        let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+        let t = if k > 0.0 { normalize(view * -eta + n * (eta * cosi - sqrt(k))) } else { r };
+        let thick: f32 = 0.1;
+        let a = float3 { exp(-m.absorption.x * thick), exp(-m.absorption.y * thick), exp(-m.absorption.z * thick) };
+        let through = env_lookup(f.specular, t, s.roughness * (f.spec_mips - 1.0)) * s.base * a;
+        diffuse = lerp(diffuse, through * (float3_1 - f0 * ab.x - float3_1 * ab.y), m.transmission);
+    }
     let ao = 1.0 + m.occlusion * (gpu::sample(m.occlusion_tex, gpu::LINEAR_REPEAT, v.uv).x - 1.0);
     c = c + (diffuse + spec) * ao;
     c = c + m.emissive * xyz(gpu::sample(m.emissive_tex, gpu::LINEAR_REPEAT, v.uv));
@@ -142,14 +155,16 @@ fn main() {
     var frames: i64 = -1;
     var yaw: f32 = 0.6;
     var pitch: f32 = 0.15;
+    var zoom: f32 = 1.0;
     var i: i64 = 1;
     while i < argv.len {
         if argv[i] == "--hdr" && i + 1 < argv.len { hdr = str(argv[i + 1]); i += 2; continue; }
         if argv[i] == "--out" && i + 1 < argv.len { out = str(argv[i + 1]); i += 2; continue; }
-        if (argv[i] == "--yaw" || argv[i] == "--pitch") && i + 1 < argv.len {
+        if (argv[i] == "--yaw" || argv[i] == "--pitch" || argv[i] == "--zoom") && i + 1 < argv.len {
             let v, ok = parse_flt(argv[i + 1]);
             if ok && argv[i] == "--yaw" { yaw = v as f32; }
             if ok && argv[i] == "--pitch" { pitch = v as f32; }
+            if ok && argv[i] == "--zoom" && v > 0.0 { zoom = v as f32; }
             i += 2;
             continue;
         }
@@ -202,7 +217,7 @@ fn main() {
 
     let center = (m.lo + m.hi) * 0.5;
     let radius = length(m.hi - m.lo) * 0.5;
-    var dist = radius * 2.6;
+    var dist = radius * 2.6 / zoom;
     var last = gpu::mouse_position();
     var shots = 0;
     var n: i64 = 0;

@@ -61,12 +61,20 @@ never had most of them:
 
 Implemented, beyond the subset of gpu.md §5.2: fixed arrays and global
 tables of literals, group memory (`gpu::GroupShared<T>`), barriers,
-atomics and wave operations. Rejected with an error naming the construct:
-references other than an entry point's uniform block, multiple returns,
-ADTs and `match`, function values and nested functions, `return … from`,
-non-fixed arrays, slices, strings, optionals, varints, relative references,
-recursion, globals other than constants and group memory, and integers
-other than `i32` and `u32`.
+atomics and wave operations; references as parameters and locals (§3),
+multiple returns and `return … from` (§4); fixed-mode ADTs, `match` and
+case functions, with ADTs read from buffers in Goose's packed layout (§5).
+`packages/gpu/test/language.goose` runs one function over all of them on
+the GPU and the CPU and compares the results, and the glTF path tracer's
+materials are an ADT (`Bsdf`, opaque or glass with volume absorption)
+whose overloads the bounce loop dispatches to.
+
+Rejected with an error naming the construct: optional references,
+references in structs, rebinding and references as results (§8); storing
+an ADT into a buffer and ADTs in push constants (below); variable-mode
+ADTs; function values and nested functions; non-fixed arrays, slices,
+strings, varints, relative references; recursion; globals other than
+constants and group memory; and integers other than `i32` and `u32`.
 
 ## 3. References as parameters
 
@@ -115,7 +123,17 @@ MSL lowers unions portably, so a value is a struct of the tag and the
 payload as 32-bit words, `uint` in both dialects, and a variant's fields
 are read and written with bit casts (`asfloat`, `as_type<float>`) at their
 offsets. Goose's packed layout is the layout in buffers too: an array of
-`Material` uploaded from the CPU is read as is.
+`Material` uploaded from the CPU is read as is, each word put together
+from the two aligned ones around it, since the payload follows a tag of
+one byte (two past 256 variants) and so starts unaligned.
+
+Storing one is another matter: a whole-word store of an element whose
+words it shares with its neighbours races with the invocations writing
+them. So an ADT is not stored into a buffer, nor passed as push constants
+or a uniform block, until the language lets a declaration choose its tag's
+width (`enum Material: u32 { … }` would make every payload word-aligned);
+that is a language question, and the GPU is the first place that needs
+it.
 
 `match` lowers to a `switch` on the tag; binders by value read the
 payload's words into the variant's struct. Integer `match` lowers to a

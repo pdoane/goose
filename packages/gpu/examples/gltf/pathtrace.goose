@@ -12,7 +12,7 @@
 // opacity's probability, pass the ray on. Metal 4 only, so far: Vulkan's
 // ray queries wait for a driver with them.
 //
-//   goose pathtrace.goose -- [model.glb] [--hdr sky.hdr] [--yaw r --pitch r]
+//   goose pathtrace.goose -- [model.glb] [--hdr sky.hdr] [--yaw r --pitch r --zoom k]
 //                            [--frames N --out shot.png]
 
 import gpu from "../..";
@@ -76,6 +76,10 @@ struct Surface {
     emissive: float3,
     flags: u32,
     cutoff: f32,
+    transmission: f32,
+    ior: f32,
+    absorption: float3,
+    entering: u32,      // the ray meets the surface's outside, against its winding's normal
 }
 
 fn surface_at(refs: scene::Refs, h: gpu::Hit, ray: gpu::Ray) -> Surface {
@@ -96,6 +100,7 @@ fn surface_at(refs: scene::Refs, h: gpu::Hit, ray: gpu::Ray) -> Surface {
     let pb = xyz(gpu::mul(inst.world, float4 { b.pos.x, b.pos.y, b.pos.z, 1.0 }));
     let pc = xyz(gpu::mul(inst.world, float4 { c.pos.x, c.pos.y, c.pos.z, 1.0 }));
     var geo = normalize(cross(pb - pa, pc - pa));
+    let entering: u32 = if dot(geo, ray.dir) < 0.0 { 1 } else { 0 };
     if dot(geo, ray.dir) > 0.0 { geo = geo * -1.0; }
     if dot(n, geo) < 0.0 { n = n * -1.0; }
 
@@ -132,7 +137,8 @@ fn surface_at(refs: scene::Refs, h: gpu::Hit, ray: gpu::Ray) -> Surface {
     let pos = ray.origin + ray.dir * h.t;
     Surface { pos: pos, n: n, geo: geo, base: base, metallic: clamp(m.metallic * mr.z, 0.0, 1.0),
               roughness: clamp(m.roughness * mr.y, 0.04, 1.0), emissive: em, flags: m.flags,
-              cutoff: m.alpha_cutoff }
+              cutoff: m.alpha_cutoff, transmission: m.transmission, ior: m.ior, absorption: m.absorption,
+              entering: entering }
 }
 
 fn env_at(env: gpu::Texture2D<float4>, d: float3) -> float3 {
@@ -140,6 +146,41 @@ fn env_at(env: gpu::Texture2D<float4>, d: float3) -> float3 {
 }
 
 fn lum(c: float3) -> f32 { c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722 }
+
+// What a surface does with light, a kind each: glTF's metallic-roughness
+// model, or a smooth dielectric that light passes through
+// (KHR_materials_transmission), absorbing as it goes inside
+// (KHR_materials_volume). Each kind's functions follow; the path loop calls
+// them by the kind, as case functions (spec §8.2), and a new kind is a
+// variant and its overloads, which the compiler asks for.
+enum Bsdf {
+    Opaque { s: pbr::Surface },
+    Glass { tint: float3, ior: f32, absorption: float3 },
+}
+
+fn bsdf_of(s: Surface) -> Bsdf {
+    if s.transmission > 0.5 {
+        return Bsdf.Glass { tint: xyz(s.base), ior: s.ior, absorption: s.absorption };
+    }
+    Bsdf.Opaque { s: pbr::Surface { base: xyz(s.base), metallic: s.metallic, roughness: s.roughness } }
+}
+
+// Where a path goes from a surface: the direction, what its throughput is
+// multiplied by (zero to end it), and whether it passed through.
+struct Bounce { dir: float3, weight: float3, through: u32 }
+
+// What a bounce needs: the shading normal and the geometric one, both
+// facing the ray; the direction back along it; whether the ray comes from
+// outside; and three random numbers.
+struct At { n: float3, geo: float3, v: float3, entering: u32, u: float3 }
+
+// Light from direction l reflected toward v, which a delta lobe has none of.
+fn direct(b: Bsdf.Opaque, at: At, l: float3) -> float3 { pbr::brdf(b.s, at.n, at.v, l) }
+fn direct(g: Bsdf.Glass, at: At, l: float3) -> float3 { float3_0 }
+
+// What the medium on a surface's inside absorbs per unit of distance.
+fn absorption(b: Bsdf.Opaque) -> float3 { float3_0 }
+fn absorption(g: Bsdf.Glass) -> float3 { g.absorption }
 
 // The density of drawing l from the mix of the two lobes.
 fn lobe_pdf(s: pbr::Surface, n: float3, v: float3, l: float3, spec: f32) -> f32 {
@@ -151,6 +192,42 @@ fn lobe_pdf(s: pbr::Surface, n: float3, v: float3, l: float3, spec: f32) -> f32 
     let alpha = max(s.roughness * s.roughness, 0.002);
     let ps = pbr::ggx_d(nh, alpha) * nh / (4.0 * vh);
     spec * ps + (1.0 - spec) * nl / pbr::PI
+}
+
+// GGX's lobe or the diffuse one, by how much each reflects, weighted by
+// the density of both together.
+fn scatter(b: Bsdf.Opaque, at: At) -> Bounce {
+    let s = b.s;
+    let f0 = lerp(float3 { 0.04, 0.04, 0.04 }, s.base, s.metallic);
+    let spec = clamp(lum(f0) / (lum(f0) + lum(s.base) * (1.0 - s.metallic) + 0.0001), 0.15, 0.95);
+    var l = float3_0;
+    if at.u.z < spec {
+        let alpha = max(s.roughness * s.roughness, 0.002);
+        let h = pbr::ggx_half(float2 { at.u.x, at.u.y }, at.n, alpha);
+        l = h * (2.0 * dot(at.v, h)) - at.v;
+    } else {
+        l = pbr::cosine_dir(float2 { at.u.x, at.u.y }, at.n);
+    }
+    let pdf = lobe_pdf(s, at.n, at.v, l, spec);
+    if pdf <= 0.0 || dot(l, at.geo) <= 0.0 { return Bounce { dir: l, weight: float3_0, through: 0 }; }
+    Bounce { dir: l, weight: pbr::brdf(s, at.n, at.v, l) / pdf, through: 0 }
+}
+
+// Reflected or refracted by Fresnel's odds, all of the light either way,
+// refraction tinted by the base colour.
+fn scatter(g: Bsdf.Glass, at: At) -> Bounce {
+    let cosi = clamp(dot(at.n, at.v), 0.0, 1.0);
+    let eta = if at.entering != 0 { 1.0 / g.ior } else { g.ior };
+    let sin2t = eta * eta * (1.0 - cosi * cosi);
+    let reflect = at.n * (2.0 * cosi) - at.v;
+    if sin2t >= 1.0 { return Bounce { dir: reflect, weight: float3_1, through: 0 }; }
+    let cost = sqrt(1.0 - sin2t);
+    let rs = (eta * cosi - cost) / (eta * cosi + cost);
+    let rp = (cosi - eta * cost) / (cosi + eta * cost);
+    let fresnel = 0.5 * (rs * rs + rp * rp);
+    if at.u.z < fresnel { return Bounce { dir: reflect, weight: float3_1, through: 0 }; }
+    let refract = at.v * -eta + at.n * (eta * cosi - cost);
+    Bounce { dir: normalize(refract), weight: g.tint, through: 1 }
 }
 
 fn offset(p: float3, n: float3) -> float3 { p + n * 0.0005 }
@@ -191,12 +268,15 @@ compute(8, 8) fn trace_kernel(p: Trace, cam: const Camera&) {
     var through = float3_1;
     var bounce: u32 = 0;
     var passes: u32 = 0;
+    var medium = float3_0;      // what the space the ray travels through absorbs
     loop {
         let h = gpu::trace(p.scene, ray, 255);
         if h.kind == gpu::HIT_NONE {
             radiance = radiance + through * env_at(p.env, ray.dir);
             break;
         }
+        // What the medium the ray crossed absorbed on the way (Beer-Lambert).
+        through = through * float3 { exp(-medium.x * h.t), exp(-medium.y * h.t), exp(-medium.z * h.t) };
         let s = surface_at(p.refs, h, ray);
         // Cut-out and see-through texels pass the ray on, a few at most.
         rng = next(rng);
@@ -208,36 +288,30 @@ compute(8, 8) fn trace_kernel(p: Trace, cam: const Camera&) {
             continue;
         }
         radiance = radiance + through * s.emissive;
-        let v = ray.dir * -1.0;
-        let surf = pbr::Surface { base: xyz(s.base), metallic: s.metallic, roughness: s.roughness };
-
-        // The sun, if nothing is in the way.
-        let shadow = gpu::Ray { origin: offset(s.pos, s.geo), t_min: 0.0, dir: cam.sun, t_max: 1e30 };
-        rng = next(rng);
-        if dot(s.n, cam.sun) > 0.0 && sees_sky(p, shadow, rng, p.alpha != 0) {
-            radiance = radiance + through * pbr::brdf(surf, s.n, v, cam.sun) * cam.sun_color * cam.sun_strength;
-        }
-        if bounce >= cam.bounces { break; }
-
-        // The next direction, from one lobe or the other.
-        let f0 = lerp(float3 { 0.04, 0.04, 0.04 }, surf.base, surf.metallic);
-        let spec = clamp(lum(f0) / (lum(f0) + lum(surf.base) * (1.0 - surf.metallic) + 0.0001), 0.15, 0.95);
+        let b = bsdf_of(s);
         rng = next(rng);
         let u1 = unit(rng);
         rng = next(rng);
         let u2 = unit(rng);
         rng = next(rng);
-        var l = float3_0;
-        if unit(rng) < spec {
-            let alpha = max(surf.roughness * surf.roughness, 0.002);
-            let hv = pbr::ggx_half(float2 { u1, u2 }, s.n, alpha);
-            l = hv * (2.0 * dot(v, hv)) - v;
-        } else {
-            l = pbr::cosine_dir(float2 { u1, u2 }, s.n);
+        let at = At { n: s.n, geo: s.geo, v: ray.dir * -1.0, entering: s.entering, u: float3 { u1, u2, unit(rng) } };
+
+        // The sun, if nothing is in the way and the surface reflects it.
+        let shadow = gpu::Ray { origin: offset(s.pos, s.geo), t_min: 0.0, dir: cam.sun, t_max: 1e30 };
+        rng = next(rng);
+        if dot(s.n, cam.sun) > 0.0 {
+            let lit = direct(b, at, cam.sun);
+            if lum(lit) > 0.0 && sees_sky(p, shadow, rng, p.alpha != 0) {
+                radiance = radiance + through * lit * cam.sun_color * cam.sun_strength;
+            }
         }
-        let pdf = lobe_pdf(surf, s.n, v, l, spec);
-        if pdf <= 0.0 || dot(l, s.geo) <= 0.0 { break; }
-        through = through * pbr::brdf(surf, s.n, v, l) / pdf;
+        if bounce >= cam.bounces { break; }
+
+        let next_bounce = scatter(b, at);
+        if lum(next_bounce.weight) <= 0.0 { break; }
+        through = through * next_bounce.weight;
+        // Through a surface: into its medium from outside, out of it from inside.
+        if next_bounce.through != 0 { medium = if s.entering != 0 { absorption(b) } else { float3_0 }; }
         // Past three bounces, paths end with the chance they carry little.
         if bounce >= 3 {
             let q = clamp(max(through.x, max(through.y, through.z)), 0.05, 1.0);
@@ -245,7 +319,8 @@ compute(8, 8) fn trace_kernel(p: Trace, cam: const Camera&) {
             if unit(rng) > q { break; }
             through = through / q;
         }
-        ray = gpu::Ray { origin: offset(s.pos, s.geo), t_min: 0.0, dir: l, t_max: 1e30 };
+        let side = if next_bounce.through != 0 { s.geo * -1.0 } else { s.geo };
+        ray = gpu::Ray { origin: offset(s.pos, side), t_min: 0.0, dir: next_bounce.dir, t_max: 1e30 };
         bounce += 1;
     }
     // A sample that went wrong (NaN fails every comparison) counts as
@@ -284,14 +359,16 @@ fn main() {
     var frames: i64 = -1;
     var yaw: f32 = 0.6;
     var pitch: f32 = 0.15;
+    var zoom: f32 = 1.0;
     var i: i64 = 1;
     while i < argv.len {
         if argv[i] == "--hdr" && i + 1 < argv.len { hdr = str(argv[i + 1]); i += 2; continue; }
         if argv[i] == "--out" && i + 1 < argv.len { out = str(argv[i + 1]); i += 2; continue; }
-        if (argv[i] == "--yaw" || argv[i] == "--pitch") && i + 1 < argv.len {
+        if (argv[i] == "--yaw" || argv[i] == "--pitch" || argv[i] == "--zoom") && i + 1 < argv.len {
             let v, ok = parse_flt(argv[i + 1]);
             if ok && argv[i] == "--yaw" { yaw = v as f32; }
             if ok && argv[i] == "--pitch" { pitch = v as f32; }
+            if ok && argv[i] == "--zoom" && v > 0.0 { zoom = v as f32; }
             i += 2;
             continue;
         }
@@ -356,7 +433,7 @@ fn main() {
     let shower = gpu::pipeline(show_vs, show_fs);
     let center = (m.lo + m.hi) * 0.5;
     let radius = length(m.hi - m.lo) * 0.5;
-    var dist = radius * 2.6;
+    var dist = radius * 2.6 / zoom;
     var last = gpu::mouse_position();
     var accum = gpu::Buffer { 0 };
     var aw: i64 = 0;

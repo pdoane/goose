@@ -32,6 +32,12 @@ struct Material {
     occlusion: f32,
     alpha_cutoff: f32,
     flags: u32,
+    // KHR_materials_transmission, _ior and _volume: how much light passes
+    // through, the index of refraction, and the medium's absorption per
+    // unit of distance (-ln(attenuation colour) / attenuation distance).
+    transmission: f32,
+    ior: f32,
+    absorption: float3,
     base_tex: gpu::Texture2D<float4>,
     mr_tex: gpu::Texture2D<float4>,
     normal_tex: gpu::Texture2D<float4>,
@@ -54,6 +60,9 @@ struct MaterialDesc {
     occlusion: f32,
     alpha_cutoff: f32,
     flags: u32,
+    transmission: f32,
+    ior: f32,
+    absorption: float3,
     tex: i64[5],        // base colour, metallic-roughness, normal, occlusion, emissive
 }
 
@@ -303,7 +312,19 @@ fn load(path: const u8[:], blob: u8[>..]&, verts: Vertex[>..]&, indices: u32[>..
                                roughness: num_of(json::member(pbr, "roughnessFactor"), 1.0),
                                normal_scale: num_of(json::member(json::member(m, "normalTexture"), "scale"), 1.0),
                                occlusion: num_of(json::member(json::member(m, "occlusionTexture"), "strength"), 1.0),
-                               alpha_cutoff: num_of(json::member(m, "alphaCutoff"), 0.5), flags: 0, tex: [-1; 5] };
+                               alpha_cutoff: num_of(json::member(m, "alphaCutoff"), 0.5), flags: 0,
+                               transmission: 0.0, ior: 1.5, absorption: float3_0, tex: [-1; 5] };
+        let ext = json::member(m, "extensions");
+        d.transmission = num_of(json::member(json::member(ext, "KHR_materials_transmission"), "transmissionFactor"),
+                                0.0);
+        d.ior = num_of(json::member(json::member(ext, "KHR_materials_ior"), "ior"), 1.5);
+        let vol = json::member(ext, "KHR_materials_volume");
+        var ac: f32[3] = [1.0; 3];
+        let dist = num_of(json::member(vol, "attenuationDistance"), 0.0);
+        if nums(json::member(vol, "attenuationColor"), ac) && dist > 0.0 {
+            d.absorption = float3 { -log(max(ac[0], 1e-4)) / dist, -log(max(ac[1], 1e-4)) / dist,
+                                    -log(max(ac[2], 1e-4)) / dist };
+        }
         var c: f32[4] = [1.0; 4];
         if nums(json::member(pbr, "baseColorFactor"), c) { d.base = float4 { c[0], c[1], c[2], c[3] }; }
         var e: f32[3] = [0.0; 3];
@@ -328,7 +349,8 @@ fn load(path: const u8[:], blob: u8[>..]&, verts: Vertex[>..]&, indices: u32[>..
     }
     if materials.len == 0 {
         materials.push(MaterialDesc { base: float4_1, emissive: float3_0, metallic: 1.0, roughness: 1.0,
-                                      normal_scale: 1.0, occlusion: 1.0, alpha_cutoff: 0.5, flags: 0, tex: [-1; 5] });
+                                      normal_scale: 1.0, occlusion: 1.0, alpha_cutoff: 0.5, flags: 0,
+                                      transmission: 0.0, ior: 1.5, absorption: float3_0, tex: [-1; 5] });
     }
 
     // Meshes: their primitives' first entries in `prims`.

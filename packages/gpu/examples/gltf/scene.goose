@@ -94,7 +94,8 @@ fn load(path: const u8[:], out: Model&) -> u8[>..] {
         }
         mats.push(gltf::Material { base: d.base, emissive: d.emissive, metallic: d.metallic,
                                    roughness: d.roughness, normal_scale: d.normal_scale, occlusion: d.occlusion,
-                                   alpha_cutoff: d.alpha_cutoff, flags: d.flags,
+                                   alpha_cutoff: d.alpha_cutoff, flags: d.flags, transmission: d.transmission,
+                                   ior: d.ior, absorption: d.absorption,
                                    base_tex: gpu::sampled<float4>(t[0]), mr_tex: gpu::sampled<float4>(t[1]),
                                    normal_tex: gpu::sampled<float4>(t[2]),
                                    occlusion_tex: gpu::sampled<float4>(t[3]),
