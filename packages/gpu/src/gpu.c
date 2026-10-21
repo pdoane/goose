@@ -365,11 +365,58 @@ uint32_t goose_gpu_texture(goose_gpu_texture_desc d, goose_gpu_bytes data) {
     }
     uint32_t slot = free_slot();
     if (!slot) return 0;
-    if (!backend->texture_create(slot, &d, data.len ? data.data : NULL, data.len)) return 0;
+    /* Known before the backend makes it: its upload reads the description. */
     slotkind[slot] = SLOT_TEXTURE;
     textures[slot].desc = d;
+    if (!backend->texture_create(slot, &d, data.len ? data.data : NULL, data.len)) {
+        slotkind[slot] = SLOT_FREE;
+        return 0;
+    }
     textures[slot].access = data.len ? GOOSE_GPU_ACCESS_SHADER_READ : GOOSE_GPU_ACCESS_NONE;
+    textures[slot].submitted = textures[slot].access;
     return slot;
+}
+
+/* Updates (§3): complete before the next submission runs, so the whole of
+   it sees them, draws recorded before the call included. */
+uint8_t goose_gpu_update_buffer(uint32_t slot, int64_t offset, goose_gpu_bytes data) {
+    if (!ready("gpu::update_buffer")) return 0;
+    if (slot >= GOOSE_GPU_HEAP_SLOTS || slotkind[slot] != SLOT_BUFFER || offset < 0 ||
+        offset + data.len > slotsize[slot]) {
+        goose_gpu_misuse("gpu::update_buffer of bytes %lld..%lld of buffer %u", (long long)offset,
+                         (long long)(offset + data.len), slot);
+        return 0;
+    }
+    if (!data.len) return 1;
+    return (uint8_t)backend->update_buffer(slot, offset, data.data, data.len);
+}
+
+uint8_t goose_gpu_update_texture(uint32_t slot, goose_gpu_bytes data) {
+    if (!ready("gpu::update_texture")) return 0;
+    goose_gpu_tex *t = slot < GOOSE_GPU_HEAP_SLOTS && slotkind[slot] == SLOT_TEXTURE
+                           ? &textures[slot] : NULL;
+    int64_t want = t ? (int64_t)t->desc.width * t->desc.height * goose_gpu_texel_size(t->desc.format)
+                     : 0;
+    if (!t || !want || data.len != want || slot == screenslot) {
+        goose_gpu_misuse("gpu::update_texture of %u with %lld bytes: a texture's whole mip 0, "
+                         "of a format the CPU writes", slot, (long long)data.len);
+        return 0;
+    }
+    if (!backend->update_texture(slot, t->submitted, data.data, data.len)) return 0;
+    /* A texture with no contents yet has them now, in shader reads, the
+       steady access an update leaves an empty texture in. */
+    if (t->submitted == GOOSE_GPU_ACCESS_NONE) {
+        if (t->access == GOOSE_GPU_ACCESS_NONE) t->access = GOOSE_GPU_ACCESS_SHADER_READ;
+        t->submitted = GOOSE_GPU_ACCESS_SHADER_READ;
+    }
+    return 1;
+}
+
+/* What a submission leaves each texture in, which the next one's updates
+   start from. */
+static void note_submitted(void) {
+    for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++)
+        if (slotkind[s] == SLOT_TEXTURE) textures[s].submitted = textures[s].access;
 }
 
 void goose_gpu_texture_info(uint32_t slot, goose_gpu_texture_desc *out) {
@@ -714,6 +761,7 @@ uint64_t goose_gpu_submit(void) {
     if (!ready("gpu::submit")) return 0;
     if (!outside_pass("gpu::submit")) return 0;
     uint64_t f = backend->submit(0);
+    note_submitted();
     for (int i = 0; i < MAX_READBACKS; i++)
         if (readbacks[i].used && !readbacks[i].fence) readbacks[i].fence = f;
     return f;
@@ -813,6 +861,7 @@ uint8_t goose_gpu_frame(void) {
         textures[screenslot].access = GOOSE_GPU_ACCESS_PRESENT;
     }
     uint64_t f = backend->submit(present);
+    note_submitted();
     for (int i = 0; i < MAX_READBACKS; i++)
         if (readbacks[i].used && !readbacks[i].fence) readbacks[i].fence = f;
     screenacquired = 0;

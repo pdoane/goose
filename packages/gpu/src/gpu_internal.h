@@ -79,6 +79,7 @@ typedef struct {
 typedef struct {
     goose_gpu_texture_desc desc;
     int access;             /* GOOSE_GPU_ACCESS_*, as the last barrier left it */
+    int submitted;          /*   and as the work submitted so far leaves it */
 } goose_gpu_tex;
 
 /* A pipeline as the common layer knows it: what its library said, and for
@@ -126,6 +127,12 @@ typedef struct goose_gpu_backend {
     int (*texture_create)(uint32_t slot, const goose_gpu_texture_desc *d, const void *data,
                           int64_t len);
     void (*release)(uint32_t slot, int texture);
+    /* An update (§3): `size` bytes staged now and copied ahead of the next
+       submission, ordered after the work already submitted and before the
+       work that will be, copies to one resource after each other. A
+       texture's whole mip 0, which the work submitted left in `access`. */
+    int (*update_buffer)(uint32_t slot, int64_t offset, const void *data, int64_t size);
+    int (*update_texture)(uint32_t slot, int access, const void *data, int64_t size);
     int (*compute_create)(goose_gpu_pipe *p);
     void *(*raster_create)(goose_gpu_pipe *p, const goose_gpu_targets *targets);
     void (*pipeline_release)(goose_gpu_pipe *p);

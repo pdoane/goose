@@ -828,9 +828,13 @@ Each phase lands as working commits with its tests.
    window's size changes, `begin_screen` placing its own barriers, input
    and frame timing as gfx's, and `GOOSE_GPU_HEADLESS=1` for tests.
    `packages/gpu/examples/cube.goose`, gfx's cube with Goose shaders, runs
-   in a window on Metal 4 and on KosmicKrisp. Left of phase 2: updates to
-   resources in use (`update_buffer`, `update_texture`), mipmaps, and
-   screenshots to PNG.
+   in a window on Metal 4 and on KosmicKrisp. Updates to resources in use
+   (`update_buffer`, `update_texture`) are built as §3 says, staged and
+   copied ahead of the next submission, with a barrier between copies to
+   one resource; `packages/gpu/test/updates.goose` rewrites a buffer three
+   times, overlapping, before each of six submissions in flight at once,
+   and is clean under Vulkan's synchronization validation. Left of phase
+   2: mipmaps, and screenshots to PNG.
 3. **Direct3D 12.** By this point the HLSL emitter and the ABI have been
    exercised through Vulkan, so this is mostly the backend.
 4. **Ray tracing**, on Metal and Direct3D 12: acceleration structures, the

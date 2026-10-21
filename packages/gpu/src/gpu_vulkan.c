@@ -909,6 +909,62 @@ static int vk_buffer_create(uint32_t slot, int64_t usage, const void *data, int6
     return 1;
 }
 
+/* Uploads (§3): staged now, and copied in a command buffer submitted ahead
+   of the next submission. It opens with a barrier on all the work submitted
+   before it, orders its copies one after another, and closes with one
+   before all the work after it (vk_submit). */
+static vkbuffer *stage(const void *data, int64_t len) {
+    if (npending == MAX_PENDING) {
+        goose_gpu_fail("more than %d uploads before a submission", MAX_PENDING);
+        return NULL;
+    }
+    vkbuffer *st = &pendingstaging[npending];
+    if (!host_buffer(st, (VkDeviceSize)len, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return NULL;
+    npending++;
+    memcpy(st->mapped, data, (size_t)len);
+    if (!uploads) {
+        uploads = begin_cb();
+        memory_barrier(uploads, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    } else {
+        /* After the copies before it: two to one resource write in order. */
+        memory_barrier(uploads, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+    return st;
+}
+
+static int vk_update_buffer(uint32_t slot, int64_t offset, const void *data, int64_t size) {
+    vkbuffer *st = stage(data, size);
+    if (!st) return 0;
+    VkBufferCopy region = { 0, (VkDeviceSize)offset, (VkDeviceSize)size };
+    vkCmdCopyBuffer(uploads, st->buffer, buffers[slot].buffer, 1, &region);
+    return 1;
+}
+
+/* A texture's mip 0, left by the work submitted in `access`, and by the
+   copy in that access again, or in shader reads when it had none. */
+static int vk_update_texture_at(uint32_t slot, int access, const void *data, int64_t size) {
+    vkbuffer *st = stage(data, size);
+    if (!st) return 0;
+    vkimage *im = &images[slot];
+    const goose_gpu_tex *t = goose_gpu_texture_of(slot);
+    int after = access == GOOSE_GPU_ACCESS_NONE ? GOOSE_GPU_ACCESS_SHADER_READ : access;
+    image_barrier(uploads, im, access_of(access), access_of(GOOSE_GPU_ACCESS_COPY_DST));
+    VkBufferImageCopy region = { 0 };
+    region.imageSubresource = (VkImageSubresourceLayers) { im->aspect, 0, 0, 1 };
+    region.imageExtent = (VkExtent3D) { (uint32_t)t->desc.width, (uint32_t)t->desc.height, 1 };
+    vkCmdCopyBufferToImage(uploads, st->buffer, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &region);
+    image_barrier(uploads, im, access_of(GOOSE_GPU_ACCESS_COPY_DST), access_of(after));
+    return 1;
+}
+
+static int vk_update_texture(uint32_t slot, int access, const void *data, int64_t size) {
+    return vk_update_texture_at(slot, access, data, size);
+}
+
 static int vk_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, const void *data,
                              int64_t len) {
     vkimage *im = &images[slot];
@@ -954,25 +1010,7 @@ static int vk_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, con
         write_heap(slot, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, NULL, &info);
     }
     if (!data) return 1;
-    /* The upload (§3): staged, and copied ahead of the next submission. */
-    if (npending == MAX_PENDING) {
-        goose_gpu_fail("more than %d texture uploads before a submission", MAX_PENDING);
-        return 0;
-    }
-    vkbuffer *st = &pendingstaging[npending];
-    if (!host_buffer(st, (VkDeviceSize)len, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
-    npending++;
-    memcpy(st->mapped, data, (size_t)len);
-    if (!uploads) uploads = begin_cb();
-    image_barrier(uploads, im, access_of(GOOSE_GPU_ACCESS_NONE), access_of(GOOSE_GPU_ACCESS_COPY_DST));
-    VkBufferImageCopy region = { 0 };
-    region.imageSubresource = (VkImageSubresourceLayers) { im->aspect, 0, 0, 1 };
-    region.imageExtent = ici.extent;
-    vkCmdCopyBufferToImage(uploads, st->buffer, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                           &region);
-    image_barrier(uploads, im, access_of(GOOSE_GPU_ACCESS_COPY_DST),
-                  access_of(GOOSE_GPU_ACCESS_SHADER_READ));
-    return 1;
+    return vk_update_texture_at(slot, GOOSE_GPU_ACCESS_NONE, data, len);
 }
 
 static void vk_release(uint32_t slot, int texture) {
@@ -1343,6 +1381,9 @@ static uint64_t vk_submit(int present) {
     VkCommandBuffer list[2];
     uint32_t n = 0;
     if (uploads) {
+        memory_barrier(uploads, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         vkEndCommandBuffer(uploads);
         list[n++] = uploads;
     }
@@ -1413,7 +1454,7 @@ static void vk_wait(uint64_t fence) {
 const goose_gpu_backend goose_gpu_vulkan = {
     "vulkan",
     vk_open, vk_close,
-    vk_buffer_create, vk_texture_create, vk_release,
+    vk_buffer_create, vk_texture_create, vk_release, vk_update_buffer, vk_update_texture,
     vk_compute_create, vk_raster_create, vk_pipeline_release,
     vk_begin_compute, vk_end_compute, vk_begin_pass, vk_end_pass,
     vk_dispatch, vk_draw, vk_index_buffer, vk_viewport, vk_scissor,

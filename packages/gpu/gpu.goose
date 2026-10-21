@@ -125,6 +125,9 @@ extern "goose_gpu_buffer" fn buffer_native(usage: i64, data: const u8[:], size: 
 extern "goose_gpu_buffer_size" fn buffer_size_native(index: u32) -> i64;
 extern "goose_gpu_texture" fn texture_native(desc: TextureDesc, data: const u8[:]) -> u32;
 extern "goose_gpu_release" fn release_native(index: u32);
+extern "goose_gpu_update_buffer" fn update_buffer_native(index: u32, offset: i64,
+                                                         data: const u8[:]) -> bool;
+extern "goose_gpu_update_texture" fn update_texture_native(index: u32, data: const u8[:]) -> bool;
 extern "goose_gpu_compute_pipeline" fn compute_pipeline_native(library: const u8[:]) -> u32;
 extern "goose_gpu_pipeline" fn pipeline_native(library: const u8[:], desc: PipelineDesc) -> u32;
 extern "goose_gpu_release_pipeline" fn release_pipeline_native(id: u32);
@@ -237,6 +240,18 @@ fn depth_target(width: i64, height: i64) -> Texture {
                           height: height as i32, .. })
 }
 fn release(t: Texture) { release_native(t.index); }
+
+// Updates to a buffer or texture in use (§3): the bytes copied now, and on
+// the GPU ahead of the next submission, after the work already submitted.
+// So the whole next submission sees them, draws recorded before the call
+// included, and one rewritten every frame needs no copies to rotate. A
+// texture's update is its whole mip 0; an empty one is in
+// ACCESS_SHADER_READ after it.
+fn update_buffer(b: Buffer, data: const u8[:]) -> bool { update_buffer_native(b.index, 0, data) }
+fn update_buffer(b: Buffer, offset: i64, data: const u8[:]) -> bool {
+    update_buffer_native(b.index, offset, data)
+}
+fn update_texture(t: Texture, data: const u8[:]) -> bool { update_texture_native(t.index, data) }
 
 // The handles a shader takes, from the host's.
 fn structured<T>(b: Buffer) -> StructuredBuffer<T> { StructuredBuffer<T> { b.index } }

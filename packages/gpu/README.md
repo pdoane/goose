@@ -21,10 +21,14 @@ windows; without SDL3 it builds with devices that have no window.
 
     goose test/compute.goose          a compute shader, checked against the CPU
     goose test/raster.goose           a textured quad, checked pixel by pixel
+    goose test/updates.goose          updates to resources in use, in flight
     goose examples/cube.goose         gfx's cube, in a window
 
 `GOOSE_GPU_BACKEND=vulkan` picks Vulkan over Metal on a Mac, where the
 driver is KosmicKrisp; `GOOSE_GPU_VALIDATION=1` turns on Vulkan's
 validation layer where it is installed (`VK_LAYER_PATH` names the SDK's
-layers), and `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` Metal's.
+layers), with `VK_LAYER_VALIDATE_SYNC=1` for synchronization, and
+`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` Metal's. Leave Metal's shader
+validation off under Vulkan: KosmicKrisp runs on Metal, and its texture
+reads come back zero with it on.
 `GOOSE_GPU_HEADLESS=1` opens no window.

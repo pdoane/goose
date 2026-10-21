@@ -337,6 +337,8 @@ static int mtl_buffer_create(uint32_t slot, int64_t usage, const void *data, int
     return 1;
 }
 
+static int mtl_update_texture(uint32_t slot, int access, const void *data, int64_t len);
+
 static int mtl_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, const void *data,
                               int64_t len) {
     MTLTextureDescriptor *td = [MTLTextureDescriptor new];
@@ -361,19 +363,56 @@ static int mtl_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, co
     [residency addAllocation:t];
     residencydirty = 1;
     if (!data) return 1;
-    /* The upload (§3): staged, and copied ahead of the next submission. */
+    return mtl_update_texture(slot, 0, data, len);
+}
+
+/* Uploads (§3): staged now, and copied in a command buffer committed ahead
+   of the next submission, whose encoder waits on all the work queued
+   before it and orders its copies one after another; every encoder after
+   it waits on it in turn. */
+static id<MTLBuffer> stage(const void *data, int64_t len) {
     if (npending == MAX_PENDING) {
-        goose_gpu_fail("more than %d texture uploads before a submission", MAX_PENDING);
-        return 0;
+        goose_gpu_fail("more than %d uploads before a submission", MAX_PENDING);
+        return nil;
     }
     id<MTLBuffer> staging = [device newBufferWithBytes:data length:(NSUInteger)len
                                                options:MTLResourceStorageModeShared];
+    if (!staging) {
+        goose_gpu_fail("cannot stage %lld bytes", (long long)len);
+        return nil;
+    }
     pending[npending++] = staging;
     [residency addAllocation:staging];
+    residencydirty = 1;
     if (!uploads) {
         uploads = new_cmd(&uploadalloc);
         uploadenc = [uploads computeCommandEncoder];
+        [uploadenc barrierAfterQueueStages:allstages
+                              beforeStages:MTLStageBlit
+                         visibilityOptions:MTL4VisibilityOptionDevice];
+    } else {
+        [uploadenc barrierAfterEncoderStages:MTLStageBlit
+                         beforeEncoderStages:MTLStageBlit
+                           visibilityOptions:MTL4VisibilityOptionDevice];
     }
+    return staging;
+}
+
+static int mtl_update_buffer(uint32_t slot, int64_t offset, const void *data, int64_t size) {
+    id<MTLBuffer> staging = stage(data, size);
+    if (!staging) return 0;
+    [uploadenc copyFromBuffer:staging sourceOffset:0 toBuffer:buffers[slot]
+            destinationOffset:(NSUInteger)offset size:(NSUInteger)size];
+    return 1;
+}
+
+static int mtl_update_texture(uint32_t slot, int access, const void *data, int64_t len) {
+    (void)access;
+    id<MTLBuffer> staging = stage(data, len);
+    if (!staging) return 0;
+    id<MTLTexture> t = textures[slot];
+    const goose_gpu_tex *gt = goose_gpu_texture_of(slot);
+    const goose_gpu_texture_desc *d = &gt->desc;
     NSUInteger row = (NSUInteger)d->width * (NSUInteger)goose_gpu_texel_size(d->format);
     [uploadenc copyFromBuffer:staging
                  sourceOffset:0
@@ -796,7 +835,7 @@ static uint64_t mtl_submit(int present) {
 const goose_gpu_backend goose_gpu_metal = {
     "metal",
     mtl_open, mtl_close,
-    mtl_buffer_create, mtl_texture_create, mtl_release,
+    mtl_buffer_create, mtl_texture_create, mtl_release, mtl_update_buffer, mtl_update_texture,
     mtl_compute_create, mtl_raster_create, mtl_pipeline_release,
     mtl_begin_compute, mtl_end_compute, mtl_begin_pass, mtl_end_pass,
     mtl_dispatch, mtl_draw, mtl_index_buffer, mtl_viewport, mtl_scissor,
