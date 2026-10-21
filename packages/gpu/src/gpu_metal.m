@@ -48,6 +48,9 @@ static uint64_t ringhead, ringcmdstart;
 static uint64_t uniformgen = UINT64_MAX;
 static id<MTLBuffer> buffers[GOOSE_GPU_HEAP_SLOTS];
 static id<MTLTexture> textures[GOOSE_GPU_HEAP_SLOTS];
+static NSArray<id<MTLTexture>> *mipviews[GOOSE_GPU_HEAP_SLOTS];  /* one per mip, once made */
+static id<MTLComputePipelineState> mipstate;
+static id<MTL4ArgumentTable> miptable;
 static id<MTLAccelerationStructure> accels[GOOSE_GPU_HEAP_SLOTS];
 static id<MTLBuffer> scratch[GOOSE_GPU_HEAP_SLOTS];
 static MTL4AccelerationStructureDescriptor *acceldescs[GOOSE_GPU_HEAP_SLOTS];
@@ -261,6 +264,9 @@ static void mtl_close(void) {
     npending = 0;
     for (int i = 0; i < MAX_RETIRED; i++) retired[i].buffer = nil;
     for (int i = 0; i < 4; i++) samplers[i] = nil;
+    for (int i = 0; i < GOOSE_GPU_HEAP_SLOTS; i++) mipviews[i] = nil;
+    mipstate = nil;
+    miptable = nil;
     if (queue && residency) [queue removeResidencySet:residency];
     residency = nil;
     event = nil;
@@ -356,6 +362,9 @@ static int mtl_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, co
     if (d->usage & (GOOSE_GPU_COLOR_TARGET | GOOSE_GPU_DEPTH_TARGET))
         td.usage |= MTLTextureUsageRenderTarget;
     if (d->usage & GOOSE_GPU_STORAGE) td.usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    /* Mips are written by mip_kernel, through a view of each. */
+    if (d->mips > 1 && (d->usage & GOOSE_GPU_SAMPLED) && goose_gpu_filters(d->format))
+        td.usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     id<MTLTexture> t = [device newTextureWithDescriptor:td];
     if (!t) {
         goose_gpu_fail("cannot make a %dx%d texture of format %d", d->width, d->height, d->format);
@@ -394,7 +403,7 @@ static id<MTLBuffer> stage(const void *data, int64_t len) {
                               beforeStages:MTLStageBlit
                          visibilityOptions:MTL4VisibilityOptionDevice];
     } else {
-        [uploadenc barrierAfterEncoderStages:MTLStageBlit
+        [uploadenc barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch
                          beforeEncoderStages:MTLStageBlit
                            visibilityOptions:MTL4VisibilityOptionDevice];
     }
@@ -426,6 +435,87 @@ static int mtl_update_texture(uint32_t slot, int access, const void *data, int64
              destinationSlice:0
              destinationLevel:0
             destinationOrigin:MTLOriginMake(0, 0, 0)];
+    return 1;
+}
+
+/* Mips (§3). Metal 4's generateMipmapsForTexture takes one texel of each
+   2x2 rather than filtering them, where the blit encoder before it
+   averaged, so each mip is the one above it sampled bilinearly at the
+   middle of each 2x2: their average, where the mip above is of even size. */
+static const char *mip_kernel =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "kernel void goose_gpu_mip(texture2d<float> src [[texture(0)]],\n"
+    "                          texture2d<float, access::write> dst [[texture(1)]],\n"
+    "                          uint2 id [[thread_position_in_grid]]) {\n"
+    "    if (id.x >= dst.get_width() || id.y >= dst.get_height()) return;\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    float2 uv = (float2(id) + 0.5) / float2(dst.get_width(), dst.get_height());\n"
+    "    dst.write(src.sample(s, uv, level(0)), id);\n"
+    "}\n";
+
+static int mip_pipeline(void) {
+    if (mipstate) return 1;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:@(mip_kernel) options:nil error:&err];
+    MTL4LibraryFunctionDescriptor *fd = [MTL4LibraryFunctionDescriptor new];
+    fd.name = @"goose_gpu_mip";
+    fd.library = lib;
+    MTL4ComputePipelineDescriptor *pd = [MTL4ComputePipelineDescriptor new];
+    pd.computeFunctionDescriptor = fd;
+    mipstate = lib ? [compiler newComputePipelineStateWithDescriptor:pd compilerTaskOptions:nil
+                                                               error:&err]
+                   : nil;
+    MTL4ArgumentTableDescriptor *td = [MTL4ArgumentTableDescriptor new];
+    td.maxTextureBindCount = 2;
+    miptable = [device newArgumentTableWithDescriptor:td error:&err];
+    if (!mipstate || !miptable) {
+        goose_gpu_fail("Metal made no mip pipeline: %s",
+                       err ? err.localizedDescription.UTF8String : "");
+        mipstate = nil;
+        return 0;
+    }
+    return 1;
+}
+
+/* In the upload encoder after the copies staged so far, or in an encoder
+   of the program's work of its own. */
+static int mtl_generate_mips(uint32_t slot, int access, int upload) {
+    (void)access;
+    if (!mip_pipeline()) return 0;
+    id<MTLTexture> t = textures[slot];
+    if (!mipviews[slot]) {
+        NSMutableArray *views = [NSMutableArray array];
+        for (NSUInteger i = 0; i < t.mipmapLevelCount; i++)
+            [views addObject:[t newTextureViewWithPixelFormat:t.pixelFormat
+                                                  textureType:MTLTextureType2D
+                                                       levels:NSMakeRange(i, 1)
+                                                       slices:NSMakeRange(0, 1)]];
+        mipviews[slot] = views;
+    }
+    id<MTL4ComputeCommandEncoder> e;
+    if (upload) {
+        e = uploadenc;
+        [e barrierAfterEncoderStages:MTLStageBlit
+                 beforeEncoderStages:MTLStageDispatch
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    } else {
+        begin();
+        e = open_compute();
+    }
+    [e setArgumentTable:miptable];
+    [e setComputePipelineState:mipstate];
+    for (NSUInteger i = 1; i < t.mipmapLevelCount; i++) {
+        id<MTLTexture> dst = mipviews[slot][i];
+        [miptable setTexture:mipviews[slot][i - 1].gpuResourceID atIndex:0];
+        [miptable setTexture:dst.gpuResourceID atIndex:1];
+        [e dispatchThreads:MTLSizeMake(dst.width, dst.height, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [e barrierAfterEncoderStages:MTLStageDispatch
+                 beforeEncoderStages:MTLStageDispatch | MTLStageBlit
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    }
+    if (!upload) [e endEncoding];
     return 1;
 }
 
@@ -516,6 +606,7 @@ static void mtl_release(uint32_t slot, int kind) {
     if (texture) {
         [residency removeAllocation:textures[slot]];
         textures[slot] = nil;
+        mipviews[slot] = nil;
     } else {
         [residency removeAllocation:buffers[slot]];
         buffers[slot] = nil;
@@ -919,6 +1010,7 @@ const goose_gpu_backend goose_gpu_metal = {
     "metal",
     mtl_open, mtl_close,
     mtl_buffer_create, mtl_texture_create, mtl_release, mtl_update_buffer, mtl_update_texture,
+    mtl_generate_mips,
     mtl_ray_query, mtl_accel_create, mtl_accel_build, mtl_accel_reference,
     mtl_compute_create, mtl_raster_create, mtl_pipeline_release,
     mtl_begin_compute, mtl_end_compute, mtl_begin_pass, mtl_end_pass,

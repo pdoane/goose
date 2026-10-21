@@ -16,13 +16,15 @@ compute(64) fn double(p: Push) {
 
 The compiler compiles every entry point a pipeline names when the program
 is compiled, which needs DXC (the Vulkan SDK has it) and, on a Mac, Xcode's
-Metal toolchain. The package's C needs the Vulkan headers, and SDL3 for
-windows; without SDL3 it builds with devices that have no window.
+Metal toolchain. The package's C needs the Vulkan headers, and SDL3 (3.4
+or later) for windows and image files; without SDL3 it builds with
+devices that have no window, and load_texture and save_png fail.
 
     goose test/compute.goose          a compute shader, checked against the CPU
     goose test/raster.goose           a textured quad, checked pixel by pixel
     goose test/updates.goose          updates to resources in use, in flight
     goose test/rays.goose             inline ray queries, where the device has them
+    goose test/mips.goose             generated mips, and a PNG saved and loaded back
     goose examples/cube.goose         gfx's cube, in a window
     goose examples/raytrace.goose     spinning cubes with ray-traced shadows and occlusion
 

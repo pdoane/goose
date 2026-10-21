@@ -3,8 +3,9 @@
 // descriptor structs follow gfx's wherever the two models agree (§3): a
 // buffer, texture or sampler is a handle shaders read directly, there is
 // nothing to bind but pipelines and index buffers, and the program places
-// barriers between passes. So far: devices without a window, buffers,
-// textures, compute and raster pipelines, passes, fences and read backs.
+// barriers between passes. So far: windows and devices without one,
+// buffers, textures and their mips, image files, compute and raster
+// pipelines, passes, fences, read backs and inline ray tracing.
 
 namespace gpu;
 
@@ -44,9 +45,13 @@ struct TextureDesc {
     width: i32,
     height: i32,
     depth: i32 = 1,
-    mips: i32 = 1,
+    mips: i32 = 1,          // 0: the full chain, down to 1x1
     samples: i32 = 1,
 }
+
+// load_texture's flags, as gfx's.
+let LOAD_MIPS: i64 = 1;
+let LOAD_SRGB: i64 = 2;
 
 // Pipelines, as gfx's.
 let TRIANGLES: i32 = 0;        let TRIANGLE_STRIP: i32 = 1;  let LINES: i32 = 2;
@@ -131,6 +136,10 @@ extern "goose_gpu_release" fn release_native(index: u32);
 extern "goose_gpu_update_buffer" fn update_buffer_native(index: u32, offset: i64,
                                                          data: const u8[:]) -> bool;
 extern "goose_gpu_update_texture" fn update_texture_native(index: u32, data: const u8[:]) -> bool;
+extern "goose_gpu_texture_info" fn texture_info_into(index: u32, out: TextureDesc&) -> bool;
+extern "goose_gpu_load_texture" fn load_texture_native(path: const u8[:], flags: i64) -> u32;
+extern "goose_gpu_generate_mips" fn generate_mips_native(index: u32);
+extern "goose_gpu_save_png" fn save_png_native(index: u32, path: const u8[:]) -> bool;
 extern "goose_gpu_compute_pipeline" fn compute_pipeline_native(library: const u8[:]) -> u32;
 extern "goose_gpu_pipeline" fn pipeline_native(library: const u8[:], desc: PipelineDesc) -> u32;
 extern "goose_gpu_release_pipeline" fn release_pipeline_native(id: u32);
@@ -248,6 +257,39 @@ fn depth_target(width: i64, height: i64) -> Texture {
                           height: height as i32, .. })
 }
 fn release(t: Texture) { release_native(t.index); }
+// Its description, with mips 0 resolved to the count made.
+fn texture_info(t: Texture) -> TextureDesc {
+    var d = TextureDesc { width: 0, height: 0, .. };
+    texture_info_into(t.index, d);
+    d
+}
+
+// A PNG (or .bmp) as an RGBA8 texture, or RGBA8_SRGB with LOAD_SRGB,
+// uploaded as texture(desc, data) is; with LOAD_MIPS, its full chain of
+// mips filled in the same upload.
+fn load_texture(path: const u8[:], flags: i64) -> Texture {
+    Texture { load_texture_native(path, flags) }
+}
+
+// Fills mips 1 and up from mip 0, where the work is recorded: outside
+// passes, of a sampled texture of a format that filters, from whatever
+// access it was left in; every mip is in ACCESS_SHADER_READ after it.
+fn generate_mips(t: Texture) {
+    generate_mips_native(t.index);
+    check();
+}
+
+// An RGBA8, RGBA8_SRGB or BGRA8 texture's mip 0 as a PNG file, taken where
+// it is asked for, as a read back is, and written once the submission
+// carrying it completes: at a later frame, submit, fence_done or wait, or
+// at close. screenshot() is the screen as it is shown, opaque, and goes
+// after the drawing it shows. False when the pixels cannot be taken.
+fn save_png(t: Texture, path: const u8[:]) -> bool {
+    let ok = save_png_native(t.index, path);
+    check();
+    ok
+}
+fn screenshot(path: const u8[:]) -> bool { save_png(screen(), path) }
 
 // Updates to a buffer or texture in use (§3): the bytes copied now, and on
 // the GPU ahead of the next submission, after the work already submitted.

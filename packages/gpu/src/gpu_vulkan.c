@@ -77,7 +77,7 @@ static void *loader_sym(void *l, const char *n) { return dlsym(l, n); }
     F(vkWaitSemaphores) F(vkDeviceWaitIdle) F(vkCreateImage) F(vkDestroyImage) \
     F(vkGetImageMemoryRequirements) F(vkBindImageMemory) F(vkCreateImageView) \
     F(vkDestroyImageView) F(vkCreateSampler) F(vkDestroySampler) F(vkCmdCopyBufferToImage) \
-    F(vkCmdCopyImageToBuffer) F(vkCmdCopyBuffer) F(vkCmdBeginRendering) F(vkCmdEndRendering) \
+    F(vkCmdCopyImageToBuffer) F(vkCmdCopyBuffer) F(vkCmdBlitImage) F(vkCmdBeginRendering) F(vkCmdEndRendering) \
     F(vkCmdSetViewport) F(vkCmdSetScissor) F(vkCmdDraw) F(vkCmdDrawIndexed) \
     F(vkCmdBindIndexBuffer) F(vkCmdPushDescriptorSetKHR) F(vkCreateSwapchainKHR) \
     F(vkDestroySwapchainKHR) F(vkGetSwapchainImagesKHR) F(vkAcquireNextImageKHR) \
@@ -249,7 +249,9 @@ static vkaccess access_of(int a) {
     }
 }
 
-static void image_barrier(VkCommandBuffer cb, vkimage *im, vkaccess from, vkaccess to) {
+/* Mips `base` to `base + count` of an image. */
+static void mip_barrier(VkCommandBuffer cb, vkimage *im, uint32_t base, uint32_t count,
+                        vkaccess from, vkaccess to) {
     VkImageMemoryBarrier2 b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
     b.srcStageMask = from.stage ? from.stage : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
     b.srcAccessMask = from.access;
@@ -259,12 +261,16 @@ static void image_barrier(VkCommandBuffer cb, vkimage *im, vkaccess from, vkacce
     b.newLayout = to.layout;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = im->image;
-    b.subresourceRange = (VkImageSubresourceRange) { im->aspect, 0, VK_REMAINING_MIP_LEVELS, 0,
+    b.subresourceRange = (VkImageSubresourceRange) { im->aspect, base, count, 0,
                                                      VK_REMAINING_ARRAY_LAYERS };
     VkDependencyInfo di = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     di.imageMemoryBarrierCount = 1;
     di.pImageMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cb, &di);
+}
+
+static void image_barrier(VkCommandBuffer cb, vkimage *im, vkaccess from, vkaccess to) {
+    mip_barrier(cb, im, 0, VK_REMAINING_MIP_LEVELS, from, to);
 }
 
 static void memory_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessFlags2 srca,
@@ -1018,6 +1024,43 @@ static int vk_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, con
     return vk_update_texture_at(slot, GOOSE_GPU_ACCESS_NONE, data, len);
 }
 
+/* Mips (§3): each blitted from the one before it, which a barrier first
+   makes a copy source, then every mip left in shader reads. */
+static int vk_generate_mips(uint32_t slot, int access, int upload) {
+    VkCommandBuffer cb = upload ? uploads : (begin() ? cmd : VK_NULL_HANDLE);
+    if (!cb) return 0;
+    vkimage *im = &images[slot];
+    const goose_gpu_tex *t = goose_gpu_texture_of(slot);
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(physical, im->format, &fp);
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    if ((fp.optimalTilingFeatures & need) != need) {
+        goose_gpu_fail("the device cannot filter format %d into mips", t->desc.format);
+        return 0;
+    }
+    uint32_t mips = (uint32_t)t->desc.mips;
+    vkaccess src = access_of(GOOSE_GPU_ACCESS_COPY_SRC), dst = access_of(GOOSE_GPU_ACCESS_COPY_DST);
+    mip_barrier(cb, im, 0, 1, access_of(access), src);
+    mip_barrier(cb, im, 1, mips - 1, access_of(access), dst);
+    int32_t w = t->desc.width, h = t->desc.height;
+    for (uint32_t i = 1; i < mips; i++) {
+        int32_t mw = w > 1 ? w / 2 : 1, mh = h > 1 ? h / 2 : 1;
+        VkImageBlit blit = { 0 };
+        blit.srcSubresource = (VkImageSubresourceLayers) { im->aspect, i - 1, 0, 1 };
+        blit.srcOffsets[1] = (VkOffset3D) { w, h, 1 };
+        blit.dstSubresource = (VkImageSubresourceLayers) { im->aspect, i, 0, 1 };
+        blit.dstOffsets[1] = (VkOffset3D) { mw, mh, 1 };
+        vkCmdBlitImage(cb, im->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im->image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        mip_barrier(cb, im, i, 1, dst, src);
+        w = mw;
+        h = mh;
+    }
+    mip_barrier(cb, im, 0, mips, src, access_of(GOOSE_GPU_ACCESS_SHADER_READ));
+    return 1;
+}
+
 /* KosmicKrisp has no ray queries yet; VK_KHR_ray_query comes with a device
    that does (docs/design/gpu.md §7). */
 static int vk_ray_query(void) { return 0; }
@@ -1474,6 +1517,7 @@ const goose_gpu_backend goose_gpu_vulkan = {
     "vulkan",
     vk_open, vk_close,
     vk_buffer_create, vk_texture_create, vk_release, vk_update_buffer, vk_update_texture,
+    vk_generate_mips,
     vk_ray_query, vk_accel_create, vk_accel_build, vk_accel_reference,
     vk_compute_create, vk_raster_create, vk_pipeline_release,
     vk_begin_compute, vk_end_compute, vk_begin_pass, vk_end_pass,

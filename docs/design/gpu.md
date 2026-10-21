@@ -158,7 +158,7 @@ fn buffer_size(b: Buffer) -> i64
 
 fn texture(desc: TextureDesc) -> Texture                 // and (desc, data)
 fn texture2d(width: i64, height: i64) -> Texture         fn render_target(...)   fn depth_target(...)
-fn load_texture(path: const u8[:], flags: i64) -> Texture
+fn load_texture(path: const u8[:], flags: i64) -> Texture   // PNG or BMP; LOAD_MIPS, LOAD_SRGB
 fn update_texture(t: Texture, data: const u8[:]) -> bool // and (t, region, data)
 fn read_texture<T>(t: Texture, out: T[>..]&) -> bool     fn read_pixels(t: Texture) -> u8[>..]
 fn save_png(t: Texture, path: const u8[:]) -> bool       fn screenshot(path: const u8[:]) -> bool
@@ -173,6 +173,21 @@ kinds, formats, filters and wraps. Buffer usage is what a shader may do:
 `BUFFER_READ`, `BUFFER_WRITE`, `BUFFER_INDEX`, `BUFFER_INDIRECT` and
 `BUFFER_ACCEL_INPUT` (§7). `gfx`'s `BUFFER_VERTEX` has no counterpart,
 since vertices are a buffer a vertex shader reads.
+
+Mips are `gfx`'s: `mips: 0` in a `TextureDesc` is the full chain, down to
+1x1, and `generate_mips` fills mips 1 and up from mip 0, of a sampled
+texture in a format that filters. It is recorded where it is called,
+outside passes, like the rest of the program's work, so it reads mip 0 in
+whatever access the texture was left in, places its own barriers between
+mips, and leaves every mip in `ACCESS_SHADER_READ`. `load_texture` with
+`LOAD_MIPS` fills them in the texture's upload instead, so a loaded texture
+is complete before the next submission, as any upload is. Each mip is the
+one above it averaged 2x2 (exactly, where the mip above is of even size):
+Vulkan blits with a linear filter, and Metal runs a small kernel of the
+package's own, since Metal 4's `generateMipmapsForTexture` takes one texel
+of each 2x2 rather than filtering them. Shaders choose a mip with
+`sample_level` or `texel(t, xy, mip)`; writing one mip from a shader, which
+needs a view of it, is not built.
 
 A handle is its heap index, so the value the host holds is the value a
 shader reads: a struct of handles written into a buffer is a material table
@@ -253,8 +268,13 @@ Submitting returns a fence value, and the fences of one queue complete in
 order. A read back records a copy into host-visible memory the package owns
 and is ready once the submission carrying it completes; `bytes` before then
 is a misuse. `save_png` and `screenshot` take the same route and write their
-file when the pixels arrive. `gfx`'s read backs, which wait, have no
-counterpart: a test that wants one writes `wait(submit())` before `bytes`.
+file, through SDL3's PNG writer as `gfx`'s do, at the first `frame`,
+`submit`, `fence_done`, `wait` or `close` after the pixels arrive; one that
+fails says so on stderr and in `error()`, since nothing is waiting on it.
+`screenshot` is the screen as it is shown, opaque, and goes after the
+drawing it shows and before `frame()`. `gfx`'s read backs, which wait, have
+no counterpart: a test that wants one, or a program that reads the file it
+just saved, writes `wait(submit())` first.
 
 ### Passes, pipelines and drawing
 
@@ -867,8 +887,13 @@ Each phase lands as working commits with its tests.
    copied ahead of the next submission, with a barrier between copies to
    one resource; `packages/gpu/test/updates.goose` rewrites a buffer three
    times, overlapping, before each of six submissions in flight at once,
-   and is clean under Vulkan's synchronization validation. Left of phase
-   2: mipmaps, and screenshots to PNG.
+   and is clean under Vulkan's synchronization validation. Mips,
+   `load_texture`, `save_png` and `screenshot` are built as §3 says;
+   `packages/gpu/test/mips.goose` checks generated mips on both backends,
+   and a texture saved as a PNG loading back with the same pixels and its
+   mips filled in its upload. Left of phase 2: command buffers for other
+   threads, the stream buffer, faults (§5.6) and timestamps. `f16` (§5.8)
+   is deferred, and stays designed here.
 3. **Direct3D 12.** By this point the HLSL emitter and the ABI have been
    exercised through Vulkan, so this is mostly the backend.
 4. **Ray tracing**, on Metal and Direct3D 12: acceleration structures, the
@@ -900,7 +925,9 @@ Each phase lands as working commits with its tests.
   method call finds `gpu::sample`, but UFCS resolves only in the caller's
   own namespace (docs/design/namespaces.md), so user code writes
   `gpu::sample(tex, s, uv)` today. Associated-namespace lookup for a
-  receiver whose type is namespaced would fix it for every package.
+  receiver whose type is namespaced would fix it for every package, but
+  that is the language's decision, not this design's; the package works
+  without it.
 * **Swizzles.** `vec` has `xy` and `xyz`; shaders want `v.zyx`, `v.xxy` and
   assignment to `v.xy`. A general swizzle is a language feature, not a
   library one, and should be designed for CPU code too.

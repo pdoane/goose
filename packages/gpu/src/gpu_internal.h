@@ -154,6 +154,12 @@ typedef struct goose_gpu_backend {
        texture's whole mip 0, which the work submitted left in `access`. */
     int (*update_buffer)(uint32_t slot, int64_t offset, const void *data, int64_t size);
     int (*update_texture)(uint32_t slot, int access, const void *data, int64_t size);
+    /* Mips 1 and up filled from mip 0, which the work before it left the
+       texture in `access`, and every mip left in shader reads. With
+       `upload`, after the copies staged for the next submission (a loaded
+       texture's); else where the program's work is being recorded, outside
+       passes. */
+    int (*generate_mips)(uint32_t slot, int access, int upload);
     /* Ray tracing (§7): whether the device has ray queries, and
        acceleration structures in heap slots, sized for their description
        (one of `prim` and `inst`) and built when asked, in order with the
@@ -213,6 +219,9 @@ const goose_gpu_tex *goose_gpu_texture_of(uint32_t slot);
 /* Bytes per texel of a format; 0 for a depth format the CPU does not read. */
 int goose_gpu_texel_size(int format);
 int goose_gpu_is_depth(int format);
+/* Whether mips of the format can be made by filtering: color, not
+   integer. */
+int goose_gpu_filters(int format);
 
 /* Records why the call in progress failed, for gpu::error(). */
 void goose_gpu_fail(const char *fmt, ...);

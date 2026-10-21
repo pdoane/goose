@@ -63,9 +63,15 @@ typedef struct {
     void *native;
     int64_t size;
     uint64_t fence;         /* 0 until the submission carrying it */
+    /* save_png's: the file written once the pixels arrive, and how. */
+    char *png;
+    int width, height, bgra, opaque;
 } readback;
 #define MAX_READBACKS 256
 static readback readbacks[MAX_READBACKS];
+static void note_readbacks(uint64_t f);
+static void drop_readback(readback *r);
+static void write_pngs(void);
 
 void goose_gpu_fail(const char *fmt, ...) {
     va_list args;
@@ -97,6 +103,11 @@ const goose_gpu_tex *goose_gpu_texture_of(uint32_t slot) {
 
 int goose_gpu_is_depth(int format) {
     return format >= GOOSE_GPU_DEPTH16 && format <= GOOSE_GPU_DEPTH;
+}
+
+int goose_gpu_filters(int format) {
+    return !goose_gpu_is_depth(format) && format != GOOSE_GPU_R32UI &&
+           format != GOOSE_GPU_RGBA8UI;
 }
 
 int goose_gpu_texel_size(int format) {
@@ -283,14 +294,14 @@ static void release_pipeline(goose_gpu_pipe *p) {
 
 void goose_gpu_close(void) {
     if (!backend) return;
-    backend->wait(backend->submit(0));
+    uint64_t last = backend->submit(0);
+    note_readbacks(last);
+    backend->wait(last);
+    write_pngs();
     screenslot = depthslot = 0;
     screenacquired = 0;
     for (int i = 0; i < MAX_READBACKS; i++)
-        if (readbacks[i].used) {
-            backend->readback_release(readbacks[i].native);
-            memset(&readbacks[i], 0, sizeof readbacks[i]);
-        }
+        if (readbacks[i].used) drop_readback(&readbacks[i]);
     for (int i = 0; i < GOOSE_GPU_MAX_PIPELINES; i++)
         if (pipelines[i].used) release_pipeline(&pipelines[i]);
     for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++)
@@ -354,7 +365,15 @@ uint32_t goose_gpu_texture(goose_gpu_texture_desc d, goose_gpu_bytes data) {
                          d.kind, d.format, d.width, d.height);
         return 0;
     }
-    if (d.mips < 1) d.mips = 1;
+    /* Mips 0: the full chain, down to 1x1, as gfx's. */
+    int chain = 1;
+    while (((d.width > d.height ? d.width : d.height) >> chain) > 0) chain++;
+    if (d.mips == 0) d.mips = chain;
+    if (d.mips < 0 || d.mips > chain) {
+        goose_gpu_misuse("gpu::texture of %dx%d with %d mips: at most %d", d.width, d.height,
+                         d.mips, chain);
+        return 0;
+    }
     if (d.samples < 1) d.samples = 1;
     if (d.depth < 1) d.depth = 1;
     if (data.len) {
@@ -421,10 +440,81 @@ static void note_submitted(void) {
         if (slotkind[s] == SLOT_TEXTURE) textures[s].submitted = textures[s].access;
 }
 
-void goose_gpu_texture_info(uint32_t slot, goose_gpu_texture_desc *out) {
+uint8_t goose_gpu_texture_info(uint32_t slot, goose_gpu_texture_desc *out) {
     const goose_gpu_tex *t = goose_gpu_texture_of(slot);
     if (t) *out = t->desc;
     else memset(out, 0, sizeof *out);
+    return t != NULL;
+}
+
+/* Mips 1 and up from mip 0 (§3), where the program's work is recorded:
+   after it, every mip is in shader reads. */
+static int mippable(const goose_gpu_tex *t) {
+    return t && t->desc.mips > 1 && (t->desc.usage & GOOSE_GPU_SAMPLED) &&
+           goose_gpu_filters(t->desc.format);
+}
+
+void goose_gpu_generate_mips(uint32_t slot) {
+    if (!ready("gpu::generate_mips") || !outside_pass("gpu::generate_mips")) return;
+    goose_gpu_tex *t = slot < GOOSE_GPU_HEAP_SLOTS && slotkind[slot] == SLOT_TEXTURE
+                           ? &textures[slot] : NULL;
+    if (!mippable(t) || t->access == GOOSE_GPU_ACCESS_NONE) {
+        goose_gpu_misuse("gpu::generate_mips of %u: a sampled texture with more than one mip, "
+                         "of a format that filters, with contents in mip 0", slot);
+        return;
+    }
+    if (backend->generate_mips(slot, t->access, 0)) t->access = GOOSE_GPU_ACCESS_SHADER_READ;
+}
+
+/* gfx's load_texture flags. */
+enum { LOAD_MIPS = 1, LOAD_SRGB = 2 };
+
+/* A PNG or .bmp as an RGBA8 texture, uploaded as texture(desc, data) is,
+   with its mips filled in the same upload with LOAD_MIPS. */
+uint32_t goose_gpu_load_texture(goose_gpu_bytes path, int64_t flags) {
+    if (!ready("gpu::load_texture")) return 0;
+#ifdef GOOSE_GPU_SDL
+    char buf[1024];
+    size_t n = path.len < 0 ? 0 : (size_t)path.len;
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    if (n) memcpy(buf, path.data, n);
+    buf[n] = 0;
+    int bmp = n >= 4 && SDL_strcasecmp(buf + n - 4, ".bmp") == 0;
+    SDL_Surface *loaded = bmp ? SDL_LoadBMP(buf) : SDL_LoadPNG(buf);
+    if (!loaded) {
+        goose_gpu_fail("cannot load %s: %s", buf, SDL_GetError());
+        return 0;
+    }
+    SDL_Surface *rgba = SDL_ConvertSurface(loaded, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(loaded);
+    if (!rgba) {
+        goose_gpu_fail("cannot convert %s: %s", buf, SDL_GetError());
+        return 0;
+    }
+    /* Rows as the surface has them, which may be padded. */
+    size_t row = (size_t)rgba->w * 4;
+    uint8_t *tight = malloc(row * (size_t)rgba->h);
+    for (int y = 0; y < rgba->h; y++)
+        memcpy(tight + row * (size_t)y, (uint8_t *)rgba->pixels + (size_t)rgba->pitch * (size_t)y,
+               row);
+    goose_gpu_texture_desc d = { 0, (flags & LOAD_SRGB) ? GOOSE_GPU_RGBA8_SRGB : GOOSE_GPU_RGBA8,
+                                 GOOSE_GPU_SAMPLED, rgba->w, rgba->h, 1,
+                                 (flags & LOAD_MIPS) ? 0 : 1, 1 };
+    goose_gpu_bytes data = { tight, (int64_t)(row * (size_t)rgba->h) };
+    uint32_t slot = goose_gpu_texture(d, data);
+    free(tight);
+    SDL_DestroySurface(rgba);
+    if (slot && textures[slot].desc.mips > 1 &&
+        !backend->generate_mips(slot, GOOSE_GPU_ACCESS_SHADER_READ, 1)) {
+        goose_gpu_release(slot);
+        return 0;
+    }
+    return slot;
+#else
+    (void)path; (void)flags;
+    goose_gpu_fail("this build of the gpu package has no SDL3, so no image files");
+    return 0;
+#endif
 }
 
 void goose_gpu_release(uint32_t slot) {
@@ -837,13 +927,20 @@ void goose_gpu_barrier(uint32_t slot, int64_t before, int64_t after) {
     t->access = (int)after;
 }
 
+/* The read backs recorded since the last submission are carried by this
+   one. */
+static void note_readbacks(uint64_t f) {
+    for (int i = 0; i < MAX_READBACKS; i++)
+        if (readbacks[i].used && !readbacks[i].fence) readbacks[i].fence = f;
+}
+
 uint64_t goose_gpu_submit(void) {
     if (!ready("gpu::submit")) return 0;
     if (!outside_pass("gpu::submit")) return 0;
     uint64_t f = backend->submit(0);
     note_submitted();
-    for (int i = 0; i < MAX_READBACKS; i++)
-        if (readbacks[i].used && !readbacks[i].fence) readbacks[i].fence = f;
+    note_readbacks(f);
+    write_pngs();
     return f;
 }
 
@@ -942,10 +1039,10 @@ uint8_t goose_gpu_frame(void) {
     }
     uint64_t f = backend->submit(present);
     note_submitted();
-    for (int i = 0; i < MAX_READBACKS; i++)
-        if (readbacks[i].used && !readbacks[i].fence) readbacks[i].fence = f;
+    note_readbacks(f);
     screenacquired = 0;
     if (f > 2) backend->wait(f - 2);
+    write_pngs();
     poll_events();
     framecount++;
     double t = clock_seconds();
@@ -1007,10 +1104,14 @@ void goose_gpu_set_title(goose_gpu_bytes title) {
 #endif
 }
 
-uint8_t goose_gpu_fence_done(uint64_t f) { return backend && backend->completed() >= f; }
+uint8_t goose_gpu_fence_done(uint64_t f) {
+    write_pngs();
+    return backend && backend->completed() >= f;
+}
 
 void goose_gpu_wait(uint64_t f) {
     if (backend) backend->wait(f);
+    write_pngs();
     goose_gpu_check();
 }
 
@@ -1018,7 +1119,7 @@ static uint32_t new_readback(void *native, int64_t size) {
     if (!native) return 0;
     for (uint32_t i = 1; i < MAX_READBACKS; i++)
         if (!readbacks[i].used) {
-            readbacks[i] = (readback) { 1, native, size, 0 };
+            readbacks[i] = (readback) { 1, native, size, 0, NULL, 0, 0, 0, 0 };
             return i;
         }
     backend->readback_release(native);
@@ -1072,9 +1173,73 @@ uint8_t goose_gpu_readback_bytes(uint32_t id, gs_rref out) {
     return 1;
 }
 
+static void drop_readback(readback *r) {
+    backend->readback_release(r->native);
+    free(r->png);
+    memset(r, 0, sizeof *r);
+}
+
 void goose_gpu_release_readback(uint32_t id) {
     readback *r = readback_of(id);
-    if (!r) return;
-    backend->readback_release(r->native);
-    memset(r, 0, sizeof *r);
+    if (r) drop_readback(r);
+}
+
+/* save_png and screenshot (§3): a read back of mip 0, written to the file
+   once the submission carrying it completes; the screen opaque, as it is
+   shown. True when the read back was taken. */
+uint8_t goose_gpu_save_png(uint32_t slot, goose_gpu_bytes path) {
+    if (!ready("gpu::save_png") || !outside_pass("gpu::save_png")) return 0;
+    const goose_gpu_tex *t = goose_gpu_texture_of(slot);
+    int f = t ? t->desc.format : 0;
+    if (f != GOOSE_GPU_RGBA8 && f != GOOSE_GPU_RGBA8_SRGB && f != GOOSE_GPU_BGRA8) {
+        goose_gpu_misuse("gpu::save_png of %u: only an RGBA8, RGBA8_SRGB or BGRA8 texture", slot);
+        return 0;
+    }
+#ifdef GOOSE_GPU_SDL
+    uint32_t id = goose_gpu_read_texture(slot);
+    if (!id) return 0;
+    readback *r = &readbacks[id];
+    size_t n = path.len < 0 ? 0 : (size_t)path.len;
+    r->png = malloc(n + 1);
+    if (n) memcpy(r->png, path.data, n);
+    r->png[n] = 0;
+    r->width = t->desc.width;
+    r->height = t->desc.height;
+    r->bgra = f == GOOSE_GPU_BGRA8;
+    r->opaque = slot == screenslot;
+    return 1;
+#else
+    (void)path;
+    goose_gpu_fail("this build of the gpu package has no SDL3, so no image files");
+    return 0;
+#endif
+}
+
+/* The PNGs whose pixels have arrived, written. */
+static void write_pngs(void) {
+    if (!backend) return;
+    uint64_t done = backend->completed();
+    for (int i = 0; i < MAX_READBACKS; i++) {
+        readback *r = &readbacks[i];
+        if (!r->used || !r->png || !r->fence || r->fence > done) continue;
+#ifdef GOOSE_GPU_SDL
+        uint8_t *px = malloc((size_t)r->size);
+        backend->readback_read(r->native, px, r->size);
+        if (r->opaque)
+            for (int64_t a = 3; a < r->size; a += 4) px[a] = 255;
+        SDL_Surface *surf = SDL_CreateSurfaceFrom(r->width, r->height,
+                                                  r->bgra ? SDL_PIXELFORMAT_BGRA32
+                                                          : SDL_PIXELFORMAT_RGBA32,
+                                                  px, r->width * 4);
+        if (!surf || !SDL_SavePNG(surf, r->png)) {
+            /* Nobody is waiting on the result: said now, and kept for
+               gpu::error(). */
+            goose_gpu_fail("gpu::save_png of %s: %s", r->png, SDL_GetError());
+            fprintf(stderr, "gpu: %s\n", lasterror);
+        }
+        SDL_DestroySurface(surf);
+        free(px);
+#endif
+        drop_readback(r);
+    }
 }
