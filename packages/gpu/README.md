@@ -28,6 +28,8 @@ devices that have no window, and load_texture and save_png fail.
     goose examples/cube.goose         gfx's cube, in a window
     goose examples/raytrace.goose     spinning cubes with ray-traced shadows and occlusion
     goose examples/bc/compress.goose  BC1-7 texture compression on the GPU, checked against the CPU
+    goose examples/sort/radix.goose   a stable radix sort of key-value pairs, checked against the CPU
+    goose test/groups.goose           group memory, atomics and waves, checked against the CPU
 
 `GOOSE_GPU_BACKEND=vulkan` picks Vulkan over Metal on a Mac, where the
 driver is KosmicKrisp; `GOOSE_GPU_VALIDATION=1` turns on Vulkan's
