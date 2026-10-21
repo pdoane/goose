@@ -78,6 +78,9 @@ struct GpuEmitter {
         int ind = 1;
         unordered_map<VarDef *, string> locals;
         set<VarDef *> aliases;          // `for &x`'s bindings: the element itself.
+        // Immutable integer locals known to lie in [0, bound): loop binders
+        // and lets of bounded values (Bound).
+        unordered_map<VarDef *, int64_t> bounds;
         set<string> names;
         int temps = 0;
         // The destination a value-giving loop's breaks assign, innermost last.
@@ -514,6 +517,11 @@ struct GpuEmitter {
             auto ei = EInst(t, l);
             auto ts = TagSize(ei);
             body += cat("    ", path, ".tag = ", word(off), " & ", ts == 1 ? "0xffu" : "0xffffu", ";\n");
+            auto nv = ei->en->variants.size();
+            FaultHelper();
+            body += cat("    if (", path, ".tag >= ", nv, "u) {\n        gs_fault(", Gs(), Site(l), "u, ",
+                        (int)GS_GPU_FAULT_TAG, "u, ", path, ".tag, ", nv, "u);\n        ", path,
+                        ".tag = 0u;\n    }\n");
             for (int64_t k = 0; k < AdtWords(ei, l); k++)
                 body += cat("    ", path, ".w[", k, "] = ", word(off + ts + 4 * k), ";\n");
             return;
@@ -658,6 +666,177 @@ struct GpuEmitter {
     string IndexX(Node *n) {
         if (auto i = Is<IntLit>(n)) return cat(i->val);
         return X(n);
+    }
+
+    // ------------------------------------------------------------------
+    // Faults (design/gpu_language.md §6): a check the CPU aborts on records
+    // its site, its kind and values and the invocation in the buffer at heap
+    // index 0, the first fault winning, and the invocation goes on with a
+    // defined value; the host reads the buffer when work completes and
+    // aborts. Sites are numbered from `sitebase` for the whole program.
+    int sitebase = 0;
+    vector<string> sites;
+    int Site(Line l) {
+        // A check in the standard library's wrappers (gpu::load and the
+        // rest) is the program's call of them that reached it.
+        auto path = [&](Line at) {
+            return at.fileidx >= 0 && at.fileidx < (int)ast.sources.size() ? ast.sources[at.fileidx].first
+                                                                           : string("?");
+        };
+        auto inlib = [&](Line at) {
+            auto p = path(at);
+            for (auto &c : p) if (c == '\\') c = '/';
+            return p.find("/stdlib/") != string::npos;
+        };
+        for (size_t i = callsites.size(); inlib(l) && i-- > 1;) l = callsites[i];
+        string where = path(l);
+        sites.push_back(cat(where, ":", l.line));
+        return sitebase + (int)sites.size() - 1;
+    }
+
+    string Gs() { return msl() ? "gs, " : ""; }
+
+    void FaultHelper() {
+        if (!helpers.insert("gs_fault").second) return;
+        auto stage = entry->sf->gpustage;
+        string inv;
+        if (hlsl()) {
+            inv = stage == GPU_COMPUTE ? "gs_dispatch_thread_id"
+                : stage == GPU_VERTEX ? "uint3(gs_vertex_index, gs_instance_index, 0u)"
+                                      : "uint3(uint(gs_frag_coord.x), uint(gs_frag_coord.y), 0u)";
+            helperdefs += cat("void gs_fault(uint site, uint kind, uint a, uint b) {\n"
+                              "    RWByteAddressBuffer f = ResourceDescriptorHeap[0];\n"
+                              "    uint prev;\n"
+                              "    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);\n"
+                              "    if (prev != 0u) return;\n"
+                              "    f.Store4(4, uint4(kind, a, b, 0u));\n"
+                              "    f.Store3(16, ", inv, ");\n}\n\n");
+            return;
+        }
+        inv = stage == GPU_COMPUTE ? "gs.dispatch_thread_id"
+            : stage == GPU_VERTEX ? "uint3(gs.vertex_index, gs.instance_index, 0u)"
+                                  : "uint3(uint(gs.frag_coord.x), uint(gs.frag_coord.y), 0u)";
+        helperdefs += cat("void gs_fault(thread GsCtx &gs, uint site, uint kind, uint a, uint b) {\n"
+                          "    device atomic_uint *f = reinterpret_cast<device atomic_uint *>(gs.heap[0]);\n"
+                          "    uint expected = 0u;\n"
+                          "    while (!atomic_compare_exchange_weak_explicit(f, &expected, site + 1u, "
+                          "memory_order_relaxed, memory_order_relaxed)) {\n"
+                          "        if (expected != 0u) return;\n"
+                          "    }\n"
+                          "    device uint *w = reinterpret_cast<device uint *>(gs.heap[0]);\n"
+                          "    w[1] = kind;\n    w[2] = a;\n    w[3] = b;\n"
+                          "    uint3 at = ", inv, ";\n"
+                          "    w[4] = at.x;\n    w[5] = at.y;\n    w[6] = at.z;\n}\n\n");
+    }
+
+    // An exclusive upper bound on an integer expression known to be
+    // non-negative, or -1: what lets an index skip its check without the
+    // bounds-check pass, which judges only the CPU's specializations (whose
+    // facts a GPU entry's calls must not add to). Local and syntactic:
+    // constants, bounded loop binders and lets, masks, Euclidean
+    // remainders, shifts and quotients of bounded values, and a compute
+    // entry's place in its group.
+    int64_t Bound(Node *n) {
+        int64_t v;
+        if (FoldLitInt(n, v)) return v >= 0 ? v + 1 : -1;
+        if (auto id = Is<Ident>(n)) {
+            if (!id->vdef) return -1;
+            if (id->vdef->constlit) return id->vdef->constval >= 0 ? id->vdef->constval + 1 : -1;
+            auto it = fs->bounds.find(id->vdef);
+            return it == fs->bounds.end() ? -1 : it->second;
+        }
+        if (auto c = Is<AsCast>(n)) {
+            auto t = c->totype ? c->totype : c->exprtype;
+            return t->kind == TY_INT && IsScalar(t) ? Bound(c->child) : -1;
+        }
+        if (auto d = Is<Dot>(n); d && d->IsField()) {
+            // gpu::group_thread_id().x and the rest.
+            auto c = Is<Call>(d->obj);
+            if (c && c->spec && c->spec->sf->isextern && c->spec->sf->cname == "gs_shader_group_thread_id" &&
+                entry->sf->gpustage == GPU_COMPUTE) {
+                auto k = d->name == "x" ? 0 : d->name == "y" ? 1 : d->name == "z" ? 2 : -1;
+                return k >= 0 ? entry->sf->groupsize[k] : -1;
+            }
+            return -1;
+        }
+        if (auto c = Is<Call>(n)) {
+            if (c->spec && c->spec->sf->isextern && c->spec->sf->cname == "gs_shader_group_index" &&
+                entry->sf->gpustage == GPU_COMPUTE)
+                return (int64_t)entry->sf->groupsize[0] * entry->sf->groupsize[1] * entry->sf->groupsize[2];
+            // A function that is one expression bounds its result as the
+            // expression does, knowing nothing of its parameters.
+            if (c->builtin < 0 && c->dispatch.empty() && c->spec && !c->spec->sf->isextern && c->spec->body &&
+                c->spec->body->stmts.empty() && c->spec->body->tail && c->spec != fs->spec) {
+                auto outer = fs->bounds;
+                fs->bounds.clear();
+                auto b = Bound(c->spec->body->tail);
+                fs->bounds = outer;
+                return b;
+            }
+            return -1;
+        }
+        auto b = Is<Binary>(n);
+        if (!b) return -1;
+        auto l = Bound(b->left), r = Bound(b->right);
+        int64_t k;
+        switch (b->op) {
+            case T_BITAND:
+                // A mask that is a non-negative constant bounds the result
+                // whatever the other side is.
+                if (FoldLitInt(b->right, k) && k >= 0) return l >= 0 ? min(l, k + 1) : k + 1;
+                if (FoldLitInt(b->left, k) && k >= 0) return r >= 0 ? min(r, k + 1) : k + 1;
+                return l >= 0 && r >= 0 ? min(l, r) : -1;
+            case T_MOD:
+                return FoldLitInt(b->right, k) && k > 0 ? k : -1;
+            case T_SHR:
+                return l >= 0 && FoldLitInt(b->right, k) && k >= 0 && k < 63 ? ((l - 1) >> k) + 1 : -1;
+            case T_DIV:
+                if (l >= 0 && FoldLitInt(b->right, k) && k > 0) return (l - 1) / k + 1;
+                // A non-negative quotient is at most its dividend (zero for a
+                // zero divisor, which faults).
+                return l >= 0 && (r >= 0 || (b->right->exprtype && b->right->exprtype->kind == TY_INT &&
+                                             b->right->exprtype->intstorage == IS_U32)) ? l : -1;
+            case T_PLUS:
+                return l >= 0 && r >= 0 ? l + r - 1 : -1;
+            default: return -1;
+        }
+    }
+
+    // Index `i` of an array of `n` elements, checked unless the index is
+    // known to be in range: out of range, it faults and reads element 0.
+    string CheckedIndex(Node *idx, int64_t n, Line l) {
+        if (auto lit = Is<IntLit>(idx)) return cat(lit->val);
+        if (auto b = Bound(idx); b >= 0 && b <= n) return X(idx);
+        auto i = X(idx);
+        FaultHelper();
+        if (helpers.insert("gs_index").second)
+            helperdefs += cat("uint gs_index(", msl() ? "thread GsCtx &gs, " : "",
+                              "uint i, uint n, uint site) {\n"
+                              "    if (i < n) return i;\n"
+                              "    gs_fault(", Gs(), "site, ", (int)GS_GPU_FAULT_INDEX, "u, i, n);\n"
+                              "    return 0u;\n}\n\n");
+        return cat("gs_index(", Gs(), "uint(", i, "), ", n, "u, ", Site(l), "u)");
+    }
+
+    // An integer division or remainder: by zero, it faults and gives 0.
+    string Divide(const string &a, const string &b, TypeExpr *t, bool mod, Line l) {
+        auto tn = ScalarName(t, l);
+        auto name = cat(mod ? "gs_mod_" : "gs_div_", tn);
+        FaultHelper();
+        if (helpers.insert(name).second) {
+            string op = mod ? (tn == "int" ? "gs_emod_int(a, b)" : "a % b") : "a / b";
+            if (mod && tn == "int") EuclidMod("a", "b", "int");
+            // MIN / -1 wraps, as any signed overflow does in release.
+            string minus1 = tn == "int" ? (mod ? "    if (b == -1) return 0;\n"
+                                               : "    if (b == -1) return int(0u - uint(a));\n")
+                                        : "";
+            helperdefs += cat(tn, " ", name, "(", msl() ? "thread GsCtx &gs, " : "", tn, " a, ", tn,
+                              " b, uint site) {\n", minus1,
+                              "    if (b != 0) return ", op, ";\n"
+                              "    gs_fault(", Gs(), "site, ", (int)GS_GPU_FAULT_DIVIDE, "u, 0u, 0u);\n"
+                              "    return 0;\n}\n\n");
+        }
+        return cat(name, "(", Gs(), a, ", ", b, ", ", Site(l), "u)");
     }
 
     // The array `n` is, by value, without a reference around it.
@@ -811,7 +990,8 @@ struct GpuEmitter {
                 auto at = ArrayType(ix->obj);
                 if (!FixedArray(at)) TypeName(at, n->line);   // Fails, saying why.
                 auto o = X(ix->obj);
-                return ElemRead(o, IndexX(ix->idx), at, n->line);
+                return ElemRead(o, ix->nobc ? IndexX(ix->idx) : CheckedIndex(ix->idx, FixedArray(at)->size, n->line),
+                                at, n->line);
             }
             case NK_ArrayLit: return ArrayLitX((ArrayLit *)n);
             case NK_StrLit: Fail(n, "strings do not run on the GPU");
@@ -1076,11 +1256,21 @@ struct GpuEmitter {
         }
         auto x = X(u->child);
         switch (u->op) {
-            case T_MINUS: return cat("(-", x, ")");
+            case T_MINUS:
+                if (msl() && SignedInt(u->exprtype)) return Wrapping("0", "-", x, u->exprtype, u->line);
+                return cat("(-", x, ")");
             case T_NOT: return cat("(!", x, ")");
             case T_BITNOT: return cat("(~", x, ")");
             default: Fail(u, "internal: unary operator");
         }
+    }
+
+    // A divisor that is a nonzero constant, which needs no check.
+    static bool ConstNonZero(Node *n) {
+        int64_t v;
+        if (FoldLitInt(n, v)) return v != 0;
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->constlit) return id->vdef->constval != 0;
+        return false;
     }
 
     // `%` is Euclidean on signed integers (spec §6.2): a helper per type.
@@ -1098,6 +1288,26 @@ struct GpuEmitter {
         return cat(name, "(", a, ", ", b, ")");
     }
 
+    // Signed arithmetic that wraps, as Goose defines it in release builds
+    // (spec §6.2). HLSL's targets wrap; MSL is C++, where signed overflow is
+    // undefined and its optimizer may assume it never happens, so there the
+    // operation is done on the unsigned bit patterns.
+    bool SignedInt(TypeExpr *t) {
+        if (!t) return false;
+        if (t->kind == TY_REF) t = t->ref->sub;
+        if (VecWidth(t)) t = VecElem(t);
+        return t->kind == TY_INT && t->intstorage == IS_I32;
+    }
+
+    string Wrapping(const string &l, const char *op, const string &r, TypeExpr *t, Line line) {
+        if (t->kind == TY_REF) t = t->ref->sub;
+        auto w = VecWidth(t);
+        auto u = w ? cat("uint", w) : string("uint");
+        auto sn = TypeName(t, line);
+        return cat("as_type<", sn, ">(as_type<", u, ">(", sn, "(", l, ")) ", op, " as_type<", u, ">(", sn, "(", r,
+                   ")))");
+    }
+
     // A shift count, any integer type in Goose (spec §6.1): masked to the
     // 32-bit width the GPU shifts at, a literal folded.
     string ShiftCount(Node *n) {
@@ -1111,6 +1321,10 @@ struct GpuEmitter {
     // Integer arithmetic on literals alone, which Goose computes at i64.
     static bool FoldLitInt(Node *n, int64_t &out) {
         if (auto i = Is<IntLit>(n)) { out = i->val; return true; }
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->isglobal && id->vdef->constlit) {
+            out = id->vdef->constval;
+            return true;
+        }
         if (auto u = Is<Unary>(n)) {
             if (!FoldLitInt(u->child, out)) return false;
             if (u->op == T_MINUS) { out = -out; return true; }
@@ -1152,14 +1366,18 @@ struct GpuEmitter {
         auto vec = lw || rw;
         switch (b->op) {
             case T_PLUS: case T_MINUS: case T_MUL: case T_DIV: {
+                if (b->op == T_DIV && !vec && lt->kind == TY_INT && !ConstNonZero(b->right))
+                    return Divide(l, r, lt, false, b->line);
                 static const char *ops[] = { "+", "-", "*", "/" };
                 auto k = b->op == T_PLUS ? 0 : b->op == T_MINUS ? 1 : b->op == T_MUL ? 2 : 3;
+                if (msl() && k < 3 && SignedInt(b->exprtype)) return Wrapping(l, ops[k], r, b->exprtype, b->line);
                 return cat("(", l, " ", ops[k], " ", r, ")");
             }
             case T_MOD: {
                 auto et = lw ? VecElem(lt) : lt;
                 if (et->kind == TY_FLT) return cat("fmod(", l, ", ", r, ")");
                 if (vec) Fail(b, "integer `%` on vectors does not run on the GPU yet");
+                if (!ConstNonZero(b->right)) return Divide(l, r, lt, true, b->line);
                 if (et->kind == TY_INT && et->intstorage == IS_I32) return EuclidMod(l, r, "int");
                 return cat("(", l, " % ", r, ")");
             }
@@ -1182,6 +1400,8 @@ struct GpuEmitter {
                 // Shift counts are masked to the width (spec §6.2), which
                 // MSL and SPIR-V leave undefined beyond it.
                 if (vec) Fail(b, "shifts on vectors do not run on the GPU yet");
+                if (msl() && b->op == T_SHL && SignedInt(b->exprtype))
+                    return Wrapping(l, "<<", r, b->exprtype, b->line);
                 return cat("(", l, b->op == T_SHL ? " << " : " >> ", r, ")");
             }
             default: break;
@@ -1227,7 +1447,13 @@ struct GpuEmitter {
             if (ot->kind == TY_REF) ot = ot->ref->sub;
             return cat(LValue(d->obj), ".", VecWidth(ot) ? string(d->name) : FieldName(d->name));
         }
-        if (auto ix = Is<Index>(n)) return cat(LValue(ix->obj), ".v[", IndexX(ix->idx), "]");
+        if (auto ix = Is<Index>(n)) {
+            auto at = ArrayType(ix->obj);
+            auto lv = LValue(ix->obj);
+            auto i = ix->nobc || !FixedArray(at) ? IndexX(ix->idx)
+                                                 : CheckedIndex(ix->idx, FixedArray(at)->size, n->line);
+            return cat(lv, ".v[", i, "]");
+        }
         return X(n);
     }
 
@@ -1844,6 +2070,8 @@ struct GpuEmitter {
                 auto name = LocalName(v);
                 if (init.empty()) L(cat(tn, " ", name, ";"));
                 else L(cat(vd->isvar ? "" : "const ", tn, " ", name, " = ", init, ";"));
+                if (!vd->isvar && !vd->inits.empty() && v->type->kind == TY_INT)
+                    if (auto b = Bound(vd->inits[0]); b >= 0) fs->bounds[v] = b;
                 return;
             }
             case NK_Assign: {
@@ -1854,15 +2082,29 @@ struct GpuEmitter {
                 if (a->pointee && !IsAlias(a->lval)) Fail(n, "references do not run on the GPU");
                 auto lv = LValue(a->lval);
                 if (a->op == T_SHLEQ || a->op == T_SHREQ) {
+                    if (msl() && a->op == T_SHLEQ && SignedInt(a->lval->exprtype)) {
+                        L(cat(lv, " = ", Wrapping(lv, "<<", ShiftCount(a->rhs), a->lval->exprtype, n->line), ";"));
+                        return;
+                    }
                     L(cat(lv, a->op == T_SHLEQ ? " <<= " : " >>= ", ShiftCount(a->rhs), ";"));
                     return;
                 }
                 auto rhs = Convert(X(a->rhs), a->rhs->exprtype, a->lval->exprtype, n->line);
+                if (msl() && SignedInt(a->lval->exprtype) &&
+                    (a->op == T_PLUSEQ || a->op == T_MINUSEQ || a->op == T_MULEQ)) {
+                    auto op = a->op == T_PLUSEQ ? "+" : a->op == T_MINUSEQ ? "-" : "*";
+                    L(cat(lv, " = ", Wrapping(lv, op, rhs, a->lval->exprtype, n->line), ";"));
+                    return;
+                }
                 if (a->op == T_ASSIGN) {
                     L(cat(lv, " = ", rhs, ";"));
                     return;
                 }
                 auto lt = a->lval->exprtype;
+                if ((a->op == T_DIVEQ || a->op == T_MODEQ) && lt->kind == TY_INT && !ConstNonZero(a->rhs)) {
+                    L(cat(lv, " = ", Divide(lv, rhs, lt, a->op == T_MODEQ, n->line), ";"));
+                    return;
+                }
                 if (a->op == T_MODEQ && lt->kind == TY_INT && lt->intstorage == IS_I32) {
                     L(cat(lv, " = ", EuclidMod(lv, rhs, "int"), ";"));
                     return;
@@ -1872,7 +2114,12 @@ struct GpuEmitter {
             }
             case NK_IncDec: {
                 auto i = (IncDec *)n;
-                L(cat(LValue(i->lval), i->op == T_INC ? "++;" : "--;"));
+                auto lv = LValue(i->lval);
+                if (msl() && SignedInt(i->lval->exprtype)) {
+                    L(cat(lv, " = ", Wrapping(lv, i->op == T_INC ? "+" : "-", "1", i->lval->exprtype, n->line), ";"));
+                    return;
+                }
+                L(cat(lv, i->op == T_INC ? "++;" : "--;"));
                 return;
             }
             case NK_IfExpr: {
@@ -1943,6 +2190,13 @@ struct GpuEmitter {
                 auto hi = Temp();
                 L(cat("const ", ctn, " ", hi, " = ", X(r ? r->hi : f->iter), ";"));
                 auto iv = LocalName(f->vdef);
+                // The binder lies in [lo, hi): bounded where lo is a
+                // non-negative constant and hi is bounded.
+                if (!f->vdef->isvar) {
+                    int64_t lov = 0;
+                    auto hib = Bound(r ? r->hi : f->iter);
+                    if ((!r || (FoldLitInt(r->lo, lov) && lov >= 0)) && hib >= 0) fs->bounds[f->vdef] = hib;
+                }
                 auto wide = TypeName(f->vdef->type, n->line) != ctn;
                 auto ctr = wide ? Temp() : iv;
                 fs->breakdsts.push_back("");
@@ -2048,6 +2302,7 @@ struct GpuEmitter {
         if (f->idxdef) {
             auto it = TypeName(f->idxdef->type, f->line);
             L(cat("const ", it, " ", LocalName(f->idxdef), " = (", it, ")", ctr, ";"));
+            fs->bounds[f->idxdef] = fa->size;
         }
         if (f->byref) {
             fs->locals[f->vdef] = cat(arr, ".v[", ctr, "]");
@@ -2822,6 +3077,8 @@ struct GpuCompiled {
     string codes[GS_GPU_FORMAT_COUNT];
     int64_t pushsize = 0, uniformsize = 0;
     uint32_t caps = 0;
+    vector<string> sites;           // Its fault sites, numbered from sitebase.
+    int sitebase = 0;
 };
 
 // The library of a pipeline's entry points (src/gpu_library.h).
@@ -2839,6 +3096,9 @@ inline string GpuLibrary(const vector<GpuCompiled> &entries) {
     }
     auto headsize = sizeof h + entries.size() * sizeof(gs_gpu_lib_entry);
     string tail;
+    string sitetext;
+    for (auto &e : entries)
+        for (size_t i = 0; i < e.sites.size(); i++) sitetext += cat(e.sitebase + (int)i, "\t", e.sites[i], "\n");
     auto add = [&](const string &bytes) {
         gs_gpu_lib_range r { (uint32_t)(headsize + tail.size()), (uint32_t)bytes.size() };
         tail += bytes;
@@ -2854,6 +3114,8 @@ inline string GpuLibrary(const vector<GpuCompiled> &entries) {
         for (int f = 0; f < GS_GPU_FORMAT_COUNT; f++) le.code[f] = add(e.codes[f]);
         out += string((const char *)&le, sizeof le);
     }
+    h.sites = add(sitetext);
+    memcpy(out.data(), &h, sizeof h);
     return out + tail;
 }
 
@@ -2892,6 +3154,7 @@ inline void GpuCheckInterface(FnSpec *vs, FnSpec *fs, Line l) {
 // its library. Errors are reported, each call's on its own.
 inline void CompileGpuEntries(Ast &ast, const GpuCompileOptions &opts) {
     map<vector<FnSpec *>, const string *> done;
+    int nextsite = 0;       // Fault sites are numbered across the program's libraries.
     for (auto c : ast.gpucalls) {
         vector<FnSpec *> entries = { c->gpuspec };
         if (c->gpuspec2) entries.push_back(c->gpuspec2);
@@ -2925,9 +3188,13 @@ inline void CompileGpuEntries(Ast &ast, const GpuCompileOptions &opts) {
                 GpuEmitter *em[3] = { &dxil, &spirv, &metal };
                 for (int k = 0; k < 3; k++) {
                     current = em[k];
+                    em[k]->sitebase = nextsite;
                     texts[k] = em[k]->Emit();
                 }
                 current = nullptr;
+                out.sites = dxil.sites;
+                out.sitebase = nextsite;
+                nextsite += (int)dxil.sites.size();
                 out.pushsize = dxil.pushsize;
                 out.caps = (uint32_t)dxil.caps;
                 out.uniformsize = dxil.uniformsize;

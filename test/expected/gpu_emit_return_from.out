@@ -32,6 +32,21 @@ static uint gs_instance_index;
 static float4 gs_frag_coord;
 static bool gs_front_facing;
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
+uint gs_index(uint i, uint n, uint site) {
+    if (i < n) return i;
+    gs_fault(site, 1u, i, n);
+    return 0u;
+}
+
 void check(uint x, uint want, uint k) {
 #line 7 "return_from.goose"
     if (x == want) {
@@ -48,7 +63,7 @@ void scan(gs_array_u32_4 xs, uint want) {
     const uint t0 = 4u;
     for (uint k = 0u; k < t0; k++) {
 #line 11 "return_from.goose"
-        check(xs.v[k], want, k);
+        check(xs.v[gs_index(uint(k), 4u, 0u)], want, k);
         if (gs_rf != 0u) {
             return;
         }
@@ -152,6 +167,28 @@ struct GsCtx {
     bool lret_1_1;
 };
 
+void gs_fault(thread GsCtx &gs, uint site, uint kind, uint a, uint b) {
+    device atomic_uint *f = reinterpret_cast<device atomic_uint *>(gs.heap[0]);
+    uint expected = 0u;
+    while (!atomic_compare_exchange_weak_explicit(f, &expected, site + 1u, memory_order_relaxed, memory_order_relaxed)) {
+        if (expected != 0u) return;
+    }
+    device uint *w = reinterpret_cast<device uint *>(gs.heap[0]);
+    w[1] = kind;
+    w[2] = a;
+    w[3] = b;
+    uint3 at = gs.dispatch_thread_id;
+    w[4] = at.x;
+    w[5] = at.y;
+    w[6] = at.z;
+}
+
+uint gs_index(thread GsCtx &gs, uint i, uint n, uint site) {
+    if (i < n) return i;
+    gs_fault(gs, site, 1u, i, n);
+    return 0u;
+}
+
 void check(thread GsCtx &gs, uint x, uint want, uint k) {
 #line 7 "return_from.goose"
     if (x == want) {
@@ -168,7 +205,7 @@ void scan(thread GsCtx &gs, gs_array_u32_4 xs, uint want) {
     const uint t0 = 4u;
     for (uint k = 0u; k < t0; k++) {
 #line 11 "return_from.goose"
-        check(gs, xs.v[k], want, k);
+        check(gs, xs.v[gs_index(gs, uint(k), 4u, 0u)], want, k);
         if (gs.rf != 0u) {
             return;
         }
@@ -266,6 +303,21 @@ static uint gs_instance_index;
 static float4 gs_frag_coord;
 static bool gs_front_facing;
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
+uint gs_index(uint i, uint n, uint site) {
+    if (i < n) return i;
+    gs_fault(site, 1u, i, n);
+    return 0u;
+}
+
 void check(uint x, uint want, uint k) {
 #line 7 "return_from.goose"
     if (x == want) {
@@ -282,7 +334,7 @@ void scan(gs_array_u32_4 xs, uint want) {
     const uint t0 = 4u;
     for (uint k = 0u; k < t0; k++) {
 #line 11 "return_from.goose"
-        check(xs.v[k], want, k);
+        check(xs.v[gs_index(uint(k), 4u, 0u)], want, k);
         if (gs_rf != 0u) {
             return;
         }

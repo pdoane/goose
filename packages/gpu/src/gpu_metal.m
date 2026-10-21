@@ -360,6 +360,8 @@ static int mtl_buffer_create(uint32_t slot, int64_t usage, const void *data, int
 
 static int mtl_update_texture(uint32_t slot, int access, const void *data, int64_t len);
 
+static const void *mtl_contents(uint32_t slot) { return buffers[slot].contents; }
+
 static int mtl_texture_create(uint32_t slot, const goose_gpu_texture_desc *d, const void *data,
                               int64_t len) {
     MTLTextureDescriptor *td = [MTLTextureDescriptor new];
@@ -1063,7 +1065,7 @@ static uint64_t mtl_submit(int present) {
 const goose_gpu_backend goose_gpu_metal = {
     "metal",
     mtl_open, mtl_close,
-    mtl_buffer_create, mtl_texture_create, mtl_release, mtl_view_create, mtl_update_buffer,
+    mtl_buffer_create, mtl_contents, mtl_texture_create, mtl_release, mtl_view_create, mtl_update_buffer,
     mtl_update_texture,
     mtl_generate_mips, mtl_copy_to_texture,
     mtl_ray_query, mtl_accel_create, mtl_accel_build, mtl_accel_reference,

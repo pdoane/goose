@@ -63,7 +63,8 @@ Implemented, beyond the subset of gpu.md §5.2: fixed arrays and global
 tables of literals, group memory (`gpu::GroupShared<T>`), barriers,
 atomics and wave operations; references as parameters and locals (§3),
 multiple returns and `return … from` (§4); fixed-mode ADTs, `match` and
-case functions, with ADTs read from buffers in Goose's packed layout (§5).
+case functions, with ADTs read from buffers in Goose's packed layout (§5);
+faults (§6), with `packages/gpu/test/faults.goose` triggering each kind.
 `packages/gpu/test/language.goose` runs one function over all of them on
 the GPU and the CPU and compares the results, and the glTF path tracer's
 materials are an ADT (`Bsdf`, opaque or glass with volume absorption)
@@ -150,16 +151,33 @@ missing. Variable-mode ADTs, whose sizes differ, need §8.
 
 ## 6. Faults: checks that abort
 
-Goose checks array bounds, integer conversions, division by zero and its
-own invariants, and aborts when one fails (§9.3). A shader cannot abort.
-gpu.md §5.6 gives it a fault buffer instead: a failed check writes its
-code, its source location and the invocation's index there, once (an
-atomic compare-exchange on the first word), and the invocation goes on
-with a safe value (a clamped index, a zero quotient). The host reads the
-buffer at each fence it waits on and aborts with the CPU's diagnostic,
-naming the shader and the line. A check the bounds-check pass removes
-(§10.5) costs nothing, as on the CPU; `checkfree fn` means the same thing
-on the GPU, and index types (§10) remove the checks no analysis can.
+Goose checks array bounds, division by zero and its own invariants, and
+aborts when one fails (§9.3). A shader cannot abort. It records the fault
+instead, in a buffer the package keeps at heap index 0: the site's id (the
+first fault wins by a compare-exchange on that word), the kind of check, its
+values and the invocation. It then goes on with a defined value (element 0,
+a zero quotient, variant 0) rather than returning: making every call test
+for a fault would cost every program, and the host ends the program before
+anything reads what the invocation went on to write. Each shader library
+carries its sites' places, numbered across the program, and the host reads
+the buffer whenever it learns work has completed and aborts with the CPU's
+diagnostic. A check inside the standard library's wrappers names the
+program's call that reached it.
+
+Which checks: an index into a fixed array (or group memory) that is not
+known to be in range, an integer division or remainder whose divisor is
+not a nonzero constant, and an ADT's tag read from memory. The
+bounds-check pass (§10.5) judges the CPU's specializations, and a GPU
+entry's call sites must not add facts to a specialization the CPU shares,
+so the emitter proves bounds locally: constants, loop binders over bounded
+ranges, an array's index binder, masks and Euclidean remainders by
+constants, shifts and quotients of bounded values, single-expression
+functions, and a compute entry's place in its group. Where that is not
+enough, `x % n` says what the program knows (the idiom §6.2 gives `%`), and
+compiles to a mask for a power of two: the radix sort example's split
+positions, a permutation of its chunk, are written `to % THREADS`, which
+took it from 1.1 back to 1.7 billion pairs a second. Index types (§10)
+remove the checks no local reasoning can.
 
 Every later section's checks go through this: limited arrays' capacity,
 stack budgets, ADT tags read from buffers.

@@ -74,6 +74,13 @@ typedef struct {
 } readback;
 #define MAX_READBACKS 256
 static readback readbacks[MAX_READBACKS];
+
+/* Faults (docs/design/gpu_language.md §6): the buffer shaders record the
+   first in, at heap index 0, and the text of each site the libraries made
+   so far, by id. */
+static char **sitetext;
+static uint32_t nsites;
+static uint64_t lastfence;
 static void note_readbacks(uint64_t f);
 static void drop_readback(readback *r);
 static void write_pngs(void);
@@ -174,6 +181,41 @@ static double clock_seconds(void) {
 #endif
 }
 
+/* A fault a shader recorded, once the work that could have recorded it is
+   done: reported as the CPU would report the check, and the program ends. */
+static void check_faults(void) {
+    if (!backend) return;
+    const volatile gs_gpu_fault *f = (const volatile gs_gpu_fault *)backend->contents(0);
+    if (!f || !f->site) return;
+    backend->wait(lastfence);
+    uint32_t site = f->site - 1;
+    const char *where = site < nsites && sitetext[site] ? sitetext[site] : "an unknown place";
+    char what[160];
+    switch (f->kind) {
+        case GS_GPU_FAULT_INDEX:
+            snprintf(what, sizeof what, "index %u out of range for a length of %u", f->a, f->b);
+            break;
+        case GS_GPU_FAULT_DIVIDE: snprintf(what, sizeof what, "integer division by zero"); break;
+        case GS_GPU_FAULT_TAG:
+            snprintf(what, sizeof what, "an ADT's tag %u read from memory, which has %u variants", f->a,
+                     f->b);
+            break;
+        case GS_GPU_FAULT_FULL:
+            snprintf(what, sizeof what, "a push onto a limited array full at its capacity of %u", f->b);
+            break;
+        case GS_GPU_FAULT_EMPTY: snprintf(what, sizeof what, "a pop from an empty limited array"); break;
+        default: snprintf(what, sizeof what, "a fault of kind %u", f->kind); break;
+    }
+    fprintf(stderr, "gpu: a GPU function faulted at %s: %s (invocation %u, %u, %u)\n", where, what,
+            f->invocation[0], f->invocation[1], f->invocation[2]);
+    exit(1);
+}
+
+/* The fault buffer, made with the device. */
+static int start_faults(void) {
+    return backend->buffer_create(0, 2, NULL, (int64_t)sizeof(gs_gpu_fault));
+}
+
 static const goose_gpu_backend *pick_backend(void) {
     const char *want = getenv("GOOSE_GPU_BACKEND");
 #ifdef __APPLE__
@@ -225,7 +267,7 @@ uint8_t goose_gpu_open(int64_t flags) {
     if (!pick || !pick->open(NULL, 1)) return 0;
     backend = pick;
     reset_frame_state();
-    return 1;
+    return start_faults();
 }
 
 /* gfx's window flags. */
@@ -248,6 +290,7 @@ uint8_t goose_gpu_open_window(goose_gpu_bytes title, int64_t width, int64_t heig
         /* No window: the screen is a render target of the size asked for. */
         if (!pick->open(NULL, 1)) return 0;
         backend = pick;
+        if (!start_faults()) return 0;
         screenw = (int)width;
         screenh = (int)height;
         goose_gpu_texture_desc d = { 0, GOOSE_GPU_BGRA8, GOOSE_GPU_COLOR_TARGET | GOOSE_GPU_SAMPLED,
@@ -295,6 +338,7 @@ uint8_t goose_gpu_open_window(goose_gpu_bytes title, int64_t width, int64_t heig
     }
     window = w;
     backend = pick;
+    if (!start_faults()) return 0;
     SDL_GetWindowSizeInPixels(w, &screenw, &screenh);
     /* The screen's slot, which holds each frame's image once acquired. */
     for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS && !screenslot; s++)
@@ -324,8 +368,10 @@ static void release_pipeline(goose_gpu_pipe *p) {
 void goose_gpu_close(void) {
     if (!backend) return;
     uint64_t last = backend->submit(0);
+    lastfence = last;
     note_readbacks(last);
     backend->wait(last);
+    check_faults();
     write_pngs();
     screenslot = depthslot = 0;
     screenacquired = 0;
@@ -344,6 +390,11 @@ void goose_gpu_close(void) {
             slotkind[s] = SLOT_FREE;
             dying[s] = 0;
         }
+    backend->release(0, GOOSE_GPU_KIND_BUFFER);
+    for (uint32_t i = 0; i < nsites; i++) free(sitetext[i]);
+    free(sitetext);
+    sitetext = NULL;
+    nsites = 0;
     backend->close();
     backend = NULL;
     pass = PASS_NONE;
@@ -609,6 +660,8 @@ void goose_gpu_release(uint32_t slot) {
    since the last submission are carried by it. */
 static void reap(uint64_t fence) {
     if (!backend) return;
+    if (fence) lastfence = fence;
+    check_faults();
     uint64_t done = backend->completed();
     for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS; s++) {
         if (!dying[s]) continue;
@@ -762,6 +815,32 @@ static uint32_t new_pipeline(goose_gpu_bytes lib, int compute) {
     p->library = malloc((size_t)lib.len);
     memcpy(p->library, lib.data, (size_t)lib.len);
     p->librarylen = lib.len;
+    /* Its fault sites, "id\tplace" a line. */
+    if ((int64_t)h.sites.offset + h.sites.size <= lib.len) {
+        const char *t = (const char *)lib.data + h.sites.offset;
+        const char *end = t + h.sites.size;
+        while (t < end) {
+            const char *nl = memchr(t, '\n', (size_t)(end - t));
+            if (!nl) nl = end;
+            const char *tab = memchr(t, '\t', (size_t)(nl - t));
+            if (tab) {
+                uint32_t sid = (uint32_t)strtoul(t, NULL, 10);
+                if (sid >= nsites) {
+                    uint32_t n = sid + 64;
+                    sitetext = realloc(sitetext, n * sizeof *sitetext);
+                    memset(sitetext + nsites, 0, (n - nsites) * sizeof *sitetext);
+                    nsites = n;
+                }
+                if (!sitetext[sid]) {
+                    size_t len = (size_t)(nl - tab - 1);
+                    sitetext[sid] = malloc(len + 1);
+                    memcpy(sitetext[sid], tab + 1, len);
+                    sitetext[sid][len] = 0;
+                }
+            }
+            t = nl + 1;
+        }
+    }
     return id;
 }
 

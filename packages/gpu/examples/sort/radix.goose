@@ -45,14 +45,14 @@ struct Scan { before: u32, total: u32 }
 fn group_scan(x: u32, tid: u32) -> Scan {
     let lanes = gpu::wave_size();
     let before = gpu::wave_prefix_sum(x);
-    if gpu::wave_lane() == lanes - 1 { waves.value[tid / lanes] = before + x; }
+    if gpu::wave_lane() == lanes - 1 { waves.value[(tid / lanes) % 64] = before + x; }
     gpu::group_barrier();
     var base: u32 = 0;
     var total: u32 = 0;
     let mine = tid / lanes;
     for w: u32 in 0..THREADS / lanes {
-        if w < mine { base += waves.value[w]; }
-        total += waves.value[w];
+        if w < mine { base += waves.value[w % 64]; }
+        total += waves.value[w % 64];
     }
     gpu::group_barrier();
     Scan { before: base + before, total: total }
@@ -117,9 +117,11 @@ compute(256) fn scatter(p: Pass) {
             let b = (digit(key, p.shift) >> bit) & 1;
             let s = group_scan(1 - b, tid);
             let to = if b == 0 { s.before } else { s.total + tid - s.before };
-            keys.value[to] = key;
-            vals.value[to] = val;
-            valid.value[to] = ok;
+            // The split's positions are a permutation of the chunk's: `%`
+            // says so to the compiler, which then checks nothing.
+            keys.value[to % THREADS] = key;
+            vals.value[to % THREADS] = val;
+            valid.value[to % THREADS] = ok;
             gpu::group_barrier();
             key = keys.value[tid];
             val = vals.value[tid];
@@ -129,7 +131,7 @@ compute(256) fn scatter(p: Pass) {
         // Each digit's first key in the sorted chunk, and every key's place
         // after its digit's from before.
         let d = digit(key, p.shift);
-        let starts_run = tid == 0 || digit(keys.value[tid - 1], p.shift) != d;
+        let starts_run = tid == 0 || digit(keys.value[(tid - 1) % THREADS], p.shift) != d;
         if starts_run { starts.value[d] = tid; }
         gpu::group_barrier();
         let rank = tid - starts.value[d];
@@ -139,7 +141,7 @@ compute(256) fn scatter(p: Pass) {
             gpu::store(p.vals_out, to, val);
         }
         gpu::group_barrier();
-        let ends_run = tid == THREADS - 1 || digit(keys.value[tid + 1], p.shift) != d;
+        let ends_run = tid == THREADS - 1 || digit(keys.value[(tid + 1) % THREADS], p.shift) != d;
         if ends_run { counts.value[d] += rank + 1; }
         gpu::group_barrier();
     }

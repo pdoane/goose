@@ -63,10 +63,23 @@ uint gs_word(ByteAddressBuffer b, uint at) {
     return (lo >> s) | (b.Load((at & ~3u) + 4u) << (32u - s));
 }
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
 Light gs_read_Light_(uint index, uint at) {
     ByteAddressBuffer b = ResourceDescriptorHeap[index];
     Light r;
     r.tag = gs_word(b, at + 0u) & 0xffu;
+    if (r.tag >= 4u) {
+        gs_fault(0u, 3u, r.tag, 4u);
+        r.tag = 0u;
+    }
     r.w[0] = gs_word(b, at + 1u);
     r.w[1] = gs_word(b, at + 5u);
     r.w[2] = gs_word(b, at + 9u);
@@ -318,10 +331,30 @@ uint gs_word(device const uint *b, uint at) {
     return (lo >> s) | (b[(at >> 2) + 1u] << (32u - s));
 }
 
+void gs_fault(thread GsCtx &gs, uint site, uint kind, uint a, uint b) {
+    device atomic_uint *f = reinterpret_cast<device atomic_uint *>(gs.heap[0]);
+    uint expected = 0u;
+    while (!atomic_compare_exchange_weak_explicit(f, &expected, site + 1u, memory_order_relaxed, memory_order_relaxed)) {
+        if (expected != 0u) return;
+    }
+    device uint *w = reinterpret_cast<device uint *>(gs.heap[0]);
+    w[1] = kind;
+    w[2] = a;
+    w[3] = b;
+    uint3 at = gs.dispatch_thread_id;
+    w[4] = at.x;
+    w[5] = at.y;
+    w[6] = at.z;
+}
+
 Light gs_read_Light_(thread GsCtx &gs, uint index, uint at) {
     device const uint *b = reinterpret_cast<device const uint *>(gs.heap[index]);
     Light r;
     r.tag = gs_word(b, at + 0u) & 0xffu;
+    if (r.tag >= 4u) {
+        gs_fault(gs, 0u, 3u, r.tag, 4u);
+        r.tag = 0u;
+    }
     r.w[0] = gs_word(b, at + 1u);
     r.w[1] = gs_word(b, at + 5u);
     r.w[2] = gs_word(b, at + 9u);
@@ -567,10 +600,23 @@ uint gs_word(ByteAddressBuffer b, uint at) {
     return (lo >> s) | (b.Load((at & ~3u) + 4u) << (32u - s));
 }
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
 Light gs_read_Light_(uint index, uint at) {
     ByteAddressBuffer b = ResourceDescriptorHeap[index];
     Light r;
     r.tag = gs_word(b, at + 0u) & 0xffu;
+    if (r.tag >= 4u) {
+        gs_fault(0u, 3u, r.tag, 4u);
+        r.tag = 0u;
+    }
     r.w[0] = gs_word(b, at + 1u);
     r.w[1] = gs_word(b, at + 5u);
     r.w[2] = gs_word(b, at + 9u);

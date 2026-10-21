@@ -50,6 +50,27 @@ static uint gs_instance_index;
 static float4 gs_frag_coord;
 static bool gs_front_facing;
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
+uint gs_index(uint i, uint n, uint site) {
+    if (i < n) return i;
+    gs_fault(site, 1u, i, n);
+    return 0u;
+}
+
+uint gs_div_uint(uint a, uint b, uint site) {
+    if (b != 0) return a / b;
+    gs_fault(site, 2u, 0u, 0u);
+    return 0;
+}
+
 uint gpu_load(gpu_StructuredBuffer_u32 b, uint i) {
 #line 30 "gpu_shader.goose"
     ByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
@@ -64,17 +85,17 @@ uint group_prefix(uint x, uint tid) {
 #line 15 "group_memory.goose"
     if (WaveGetLaneIndex() == (lanes - 1u)) {
 #line 15 "group_memory.goose"
-        totals.value.v[(tid / lanes)] = (before + x);
+        totals.value.v[gs_index(uint(gs_div_uint(tid, lanes, 1u)), 8u, 2u)] = (before + x);
     }
 #line 16 "group_memory.goose"
     GroupMemoryBarrierWithGroupSync();
 #line 17 "group_memory.goose"
     uint base = 0u;
 #line 18 "group_memory.goose"
-    const uint t0 = (tid / lanes);
+    const uint t0 = gs_div_uint(tid, lanes, 3u);
     for (uint w = 0u; w < t0; w++) {
 #line 18 "group_memory.goose"
-        base += totals.value.v[w];
+        base += totals.value.v[gs_index(uint(w), 8u, 4u)];
     }
 #line 19 "group_memory.goose"
     GroupMemoryBarrierWithGroupSync();
@@ -124,7 +145,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 25 "group_memory.goose"
     if (tid < 16u) {
 #line 25 "group_memory.goose"
-        counts.value.v[tid] = 0u;
+        counts.value.v[gs_index(uint(tid), 16u, 0u)] = 0u;
     }
 #line 26 "group_memory.goose"
     GroupMemoryBarrierWithGroupSync();
@@ -147,7 +168,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 33 "group_memory.goose"
     if (tid < 16u) {
 #line 33 "group_memory.goose"
-        gpu_atomic_add(p.out_, tid, counts.value.v[tid]);
+        gpu_atomic_add(p.out_, tid, counts.value.v[gs_index(uint(tid), 16u, 5u)]);
     }
 #line 34 "group_memory.goose"
     gpu_atomic_max(p.out_, 16u, at);
@@ -211,6 +232,34 @@ struct GsCtx {
     threadgroup gpu_GroupShared_u32_8 *totals;
 };
 
+void gs_fault(thread GsCtx &gs, uint site, uint kind, uint a, uint b) {
+    device atomic_uint *f = reinterpret_cast<device atomic_uint *>(gs.heap[0]);
+    uint expected = 0u;
+    while (!atomic_compare_exchange_weak_explicit(f, &expected, site + 1u, memory_order_relaxed, memory_order_relaxed)) {
+        if (expected != 0u) return;
+    }
+    device uint *w = reinterpret_cast<device uint *>(gs.heap[0]);
+    w[1] = kind;
+    w[2] = a;
+    w[3] = b;
+    uint3 at = gs.dispatch_thread_id;
+    w[4] = at.x;
+    w[5] = at.y;
+    w[6] = at.z;
+}
+
+uint gs_index(thread GsCtx &gs, uint i, uint n, uint site) {
+    if (i < n) return i;
+    gs_fault(gs, site, 1u, i, n);
+    return 0u;
+}
+
+uint gs_div_uint(thread GsCtx &gs, uint a, uint b, uint site) {
+    if (b != 0) return a / b;
+    gs_fault(gs, site, 2u, 0u, 0u);
+    return 0;
+}
+
 uint gpu_load(thread GsCtx &gs, gpu_StructuredBuffer_u32 b, uint i) {
 #line 30 "gpu_shader.goose"
     return reinterpret_cast<device uint *>(gs.heap[b.index])[i];
@@ -224,17 +273,17 @@ uint group_prefix(thread GsCtx &gs, uint x, uint tid) {
 #line 15 "group_memory.goose"
     if (gs.simd_lane == (lanes - 1u)) {
 #line 15 "group_memory.goose"
-        (*gs.totals).value.v[(tid / lanes)] = (before + x);
+        (*gs.totals).value.v[gs_index(gs, uint(gs_div_uint(gs, tid, lanes, 1u)), 8u, 2u)] = (before + x);
     }
 #line 16 "group_memory.goose"
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #line 17 "group_memory.goose"
     uint base = 0u;
 #line 18 "group_memory.goose"
-    const uint t0 = (tid / lanes);
+    const uint t0 = gs_div_uint(gs, tid, lanes, 3u);
     for (uint w = 0u; w < t0; w++) {
 #line 18 "group_memory.goose"
-        base += (*gs.totals).value.v[w];
+        base += (*gs.totals).value.v[gs_index(gs, uint(w), 8u, 4u)];
     }
 #line 19 "group_memory.goose"
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -289,7 +338,7 @@ kernel void histogram(constant Push &gs_push [[buffer(0)]], device const ulong *
 #line 25 "group_memory.goose"
     if (tid < 16u) {
 #line 25 "group_memory.goose"
-        (*gs.counts).value.v[tid] = 0u;
+        (*gs.counts).value.v[gs_index(gs, uint(tid), 16u, 0u)] = 0u;
     }
 #line 26 "group_memory.goose"
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -313,7 +362,7 @@ kernel void histogram(constant Push &gs_push [[buffer(0)]], device const ulong *
 #line 33 "group_memory.goose"
     if (tid < 16u) {
 #line 33 "group_memory.goose"
-        gpu_atomic_add(gs, p.out_, tid, (*gs.counts).value.v[tid]);
+        gpu_atomic_add(gs, p.out_, tid, (*gs.counts).value.v[gs_index(gs, uint(tid), 16u, 5u)]);
     }
 #line 34 "group_memory.goose"
     gpu_atomic_max(gs, p.out_, 16u, at);
@@ -370,6 +419,27 @@ static uint gs_instance_index;
 static float4 gs_frag_coord;
 static bool gs_front_facing;
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
+uint gs_index(uint i, uint n, uint site) {
+    if (i < n) return i;
+    gs_fault(site, 1u, i, n);
+    return 0u;
+}
+
+uint gs_div_uint(uint a, uint b, uint site) {
+    if (b != 0) return a / b;
+    gs_fault(site, 2u, 0u, 0u);
+    return 0;
+}
+
 uint gpu_load(gpu_StructuredBuffer_u32 b, uint i) {
 #line 30 "gpu_shader.goose"
     ByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
@@ -384,17 +454,17 @@ uint group_prefix(uint x, uint tid) {
 #line 15 "group_memory.goose"
     if (WaveGetLaneIndex() == (lanes - 1u)) {
 #line 15 "group_memory.goose"
-        totals.value.v[(tid / lanes)] = (before + x);
+        totals.value.v[gs_index(uint(gs_div_uint(tid, lanes, 1u)), 8u, 2u)] = (before + x);
     }
 #line 16 "group_memory.goose"
     GroupMemoryBarrierWithGroupSync();
 #line 17 "group_memory.goose"
     uint base = 0u;
 #line 18 "group_memory.goose"
-    const uint t0 = (tid / lanes);
+    const uint t0 = gs_div_uint(tid, lanes, 3u);
     for (uint w = 0u; w < t0; w++) {
 #line 18 "group_memory.goose"
-        base += totals.value.v[w];
+        base += totals.value.v[gs_index(uint(w), 8u, 4u)];
     }
 #line 19 "group_memory.goose"
     GroupMemoryBarrierWithGroupSync();
@@ -444,7 +514,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 25 "group_memory.goose"
     if (tid < 16u) {
 #line 25 "group_memory.goose"
-        counts.value.v[tid] = 0u;
+        counts.value.v[gs_index(uint(tid), 16u, 0u)] = 0u;
     }
 #line 26 "group_memory.goose"
     GroupMemoryBarrierWithGroupSync();
@@ -467,7 +537,7 @@ void histogram(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 g
 #line 33 "group_memory.goose"
     if (tid < 16u) {
 #line 33 "group_memory.goose"
-        gpu_atomic_add(p.out_, tid, counts.value.v[tid]);
+        gpu_atomic_add(p.out_, tid, counts.value.v[gs_index(uint(tid), 16u, 5u)]);
     }
 #line 34 "group_memory.goose"
     gpu_atomic_max(p.out_, 16u, at);

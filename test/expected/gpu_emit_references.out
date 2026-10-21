@@ -43,6 +43,27 @@ static uint gs_instance_index;
 static float4 gs_frag_coord;
 static bool gs_front_facing;
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
+uint gs_div_uint(uint a, uint b, uint site) {
+    if (b != 0) return a / b;
+    gs_fault(site, 2u, 0u, 0u);
+    return 0;
+}
+
+uint gs_mod_uint(uint a, uint b, uint site) {
+    if (b != 0) return a % b;
+    gs_fault(site, 2u, 0u, 0u);
+    return 0;
+}
+
 Body gpu_load(gpu_RWStructuredBuffer_Body b, uint i) {
 #line 31 "gpu_shader.goose"
     ByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
@@ -71,8 +92,8 @@ void step_(inout Body b, float dt) {
 gs_results_u32_u32 divmod(uint a, uint b) {
 #line 18 "references.goose"
     gs_results_u32_u32 t0;
-    t0.r0 = (a / b);
-    t0.r1 = (a % b);
+    t0.r0 = gs_div_uint(a, b, 0u);
+    t0.r1 = gs_mod_uint(a, b, 1u);
     return t0;
 }
 
@@ -178,6 +199,34 @@ struct GsCtx {
     uint simd_size;
 };
 
+void gs_fault(thread GsCtx &gs, uint site, uint kind, uint a, uint b) {
+    device atomic_uint *f = reinterpret_cast<device atomic_uint *>(gs.heap[0]);
+    uint expected = 0u;
+    while (!atomic_compare_exchange_weak_explicit(f, &expected, site + 1u, memory_order_relaxed, memory_order_relaxed)) {
+        if (expected != 0u) return;
+    }
+    device uint *w = reinterpret_cast<device uint *>(gs.heap[0]);
+    w[1] = kind;
+    w[2] = a;
+    w[3] = b;
+    uint3 at = gs.dispatch_thread_id;
+    w[4] = at.x;
+    w[5] = at.y;
+    w[6] = at.z;
+}
+
+uint gs_div_uint(thread GsCtx &gs, uint a, uint b, uint site) {
+    if (b != 0) return a / b;
+    gs_fault(gs, site, 2u, 0u, 0u);
+    return 0;
+}
+
+uint gs_mod_uint(thread GsCtx &gs, uint a, uint b, uint site) {
+    if (b != 0) return a % b;
+    gs_fault(gs, site, 2u, 0u, 0u);
+    return 0;
+}
+
 Body gpu_load(thread GsCtx &gs, gpu_RWStructuredBuffer_Body b, uint i) {
 #line 31 "gpu_shader.goose"
     return reinterpret_cast<device Body *>(gs.heap[b.index])[i];
@@ -207,8 +256,8 @@ void step_(thread GsCtx &gs, thread Body& b, float dt) {
 gs_results_u32_u32 divmod(thread GsCtx &gs, uint a, uint b) {
 #line 18 "references.goose"
     gs_results_u32_u32 t0;
-    t0.r0 = (a / b);
-    t0.r1 = (a % b);
+    t0.r0 = gs_div_uint(gs, a, b, 0u);
+    t0.r1 = gs_mod_uint(gs, a, b, 1u);
     return t0;
 }
 
@@ -307,6 +356,27 @@ static uint gs_instance_index;
 static float4 gs_frag_coord;
 static bool gs_front_facing;
 
+void gs_fault(uint site, uint kind, uint a, uint b) {
+    RWByteAddressBuffer f = ResourceDescriptorHeap[0];
+    uint prev;
+    f.InterlockedCompareExchange(0, 0u, site + 1u, prev);
+    if (prev != 0u) return;
+    f.Store4(4, uint4(kind, a, b, 0u));
+    f.Store3(16, gs_dispatch_thread_id);
+}
+
+uint gs_div_uint(uint a, uint b, uint site) {
+    if (b != 0) return a / b;
+    gs_fault(site, 2u, 0u, 0u);
+    return 0;
+}
+
+uint gs_mod_uint(uint a, uint b, uint site) {
+    if (b != 0) return a % b;
+    gs_fault(site, 2u, 0u, 0u);
+    return 0;
+}
+
 Body gpu_load(gpu_RWStructuredBuffer_Body b, uint i) {
 #line 31 "gpu_shader.goose"
     ByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
@@ -335,8 +405,8 @@ void step_(inout Body b, float dt) {
 gs_results_u32_u32 divmod(uint a, uint b) {
 #line 18 "references.goose"
     gs_results_u32_u32 t0;
-    t0.r0 = (a / b);
-    t0.r1 = (a % b);
+    t0.r0 = gs_div_uint(a, b, 0u);
+    t0.r1 = gs_mod_uint(a, b, 1u);
     return t0;
 }
 

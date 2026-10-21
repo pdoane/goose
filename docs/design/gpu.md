@@ -636,19 +636,22 @@ backends require it.
 
 Goose aborts on an integer division by zero, an out-of-range index, and, in
 debug builds, signed overflow (spec §6.2). A shader cannot abort, so it
-**faults**: it writes the entry point and source line to a small fault
-buffer the package owns (the first fault per frame wins), and then stops
-doing harm: a compute invocation returns, a fragment is discarded, a vertex
-is moved outside the clip volume. The host reads the buffer at the frame
-boundary and at fence waits, and aborts with `fault in blur
-(blur.goose:41): index 9 out of range for a length of 8`, the way a misuse
-aborts.
+**faults**: it writes the check's place, its values and the invocation to
+a fault buffer the package keeps at heap index 0 (the first fault wins), and
+goes on with a defined value, the index's element 0 or a zero quotient. The
+host reads the buffer whenever it learns work has completed (a frame, a
+submission, a fence) and aborts with `a GPU function faulted at
+blur.goose:41: index 9 out of range for a length of 8 (invocation 3, 0,
+0)`. A check inside the standard library names the program's call that
+reached it. design/gpu_language.md §6 has the details.
 
 Which checks are emitted:
 
 * **Division by zero** and **local fixed-array indexing**: always, as on
-  the CPU. Bounds-check elimination (spec §10.5) runs on GPU functions as
-  on any others, so most index checks disappear; `checkfree` works too.
+  the CPU, and an ADT's tag read from memory. The bounds-check pass judges
+  the CPU's specializations, whose facts a GPU entry's calls must not add
+  to, so the emitter proves what it can locally (design/gpu_language.md
+  §6), and `x % n` states a bound wherever it cannot.
 * **Signed overflow**: debug builds only, as on the CPU. Release wraps.
 * **Resource access out of range**: debug builds only, by querying the
   resource's size. Release relies on the backend: Direct3D 12 and Vulkan
@@ -661,7 +664,14 @@ emitted as a helper.
 
 ### 5.7 Numerics
 
-Integer results are bit-exact with the same function on the CPU. For floats
+Integer results are bit-exact with the same function on the CPU, overflow
+included: signed arithmetic wraps, as Goose defines it in release builds
+(spec §6.2). HLSL's targets wrap as they are; MSL is C++, where signed
+overflow is undefined and the optimizer assumes it away, so the MSL
+emitter does signed `+`, `-`, `*`, `<<` and negation on the unsigned bit
+patterns. (The BC example found this: an encoder whose rare degenerate
+case overflowed encoded the same blocks as the CPU on Vulkan and other
+ones on Metal, but only at Metal's default optimization level.) For floats
 the default is **strict**: no contraction into fused
 multiply-adds and no reassociation, which means `-fno-fast-math` for Metal,
 whose compiler defaults to fast math, and `precise` where DXC would contract.

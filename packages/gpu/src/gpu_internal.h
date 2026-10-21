@@ -149,6 +149,8 @@ typedef struct goose_gpu_backend {
     /* A buffer of `size` bytes in heap slot `slot`, holding `data` when that
        is not null, and visible to shaders at that index. */
     int (*buffer_create)(uint32_t slot, int64_t usage, const void *data, int64_t size);
+    /* A buffer's memory as the CPU sees it (every buffer is shared). */
+    const void *(*contents)(uint32_t slot);
     /* A texture in `slot`. With data (tightly packed rows of mip 0), its
        upload is complete before the next submission runs, and leaves it in
        its steady access, shader reads. */

@@ -33,6 +33,8 @@ devices that have no window, and load_texture and save_png fail.
     goose examples/gltf/pathtrace.goose  the same scenes path traced with ray queries (Metal)
     goose test/groups.goose           group memory, atomics and waves, checked against the CPU
     goose test/views.goose            a texture's mips written through views, then sampled
+    goose test/language.goose         references, results, return-from and ADTs, checked against the CPU
+    goose test/faults.goose -- index  a shader's failed check, reported with its line (index|divide|tag)
 
 `GOOSE_GPU_BACKEND=vulkan` picks Vulkan over Metal on a Mac, where the
 driver is KosmicKrisp; `GOOSE_GPU_VALIDATION=1` turns on Vulkan's

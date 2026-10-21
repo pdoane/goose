@@ -301,9 +301,10 @@ fn main() {
             var eq = mine.x == words[at] && mine.y == words[at + 1];
             if wpb == 4 { eq = eq && mine.z == words[at + 2] && mine.w == words[at + 3]; }
             if eq { same++; }
-            else if n - same <= 3 {
+            else if k - same < 3 {
                 print("  ", f.name, " block ", bx, ",", by, " differs: CPU ", mine.x, " ", mine.y, " ",
-                      mine.z, " ", mine.w);
+                      mine.z, " ", mine.w, ", GPU ", words[at], " ", words[at + 1], " ", words[at + 2], " ",
+                      words[at + 3]);
             }
         }
         let cpuus = (clock() - t0) * 1e6 / n as f64;

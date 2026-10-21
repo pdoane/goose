@@ -131,7 +131,7 @@ kernel void literals(constant Push &gs_push [[buffer(0)]], device const ulong *g
 #line 14 "literals.goose"
     int lo = -2147483647;
 #line 15 "literals.goose"
-    lo += 16;
+    lo = as_type<int>(as_type<uint>(int(lo)) + as_type<uint>(int(16)));
 #line 16 "literals.goose"
     gpu_store(gs, p.out_, 2u, ((uint)(lo)));
 #line 17 "literals.goose"

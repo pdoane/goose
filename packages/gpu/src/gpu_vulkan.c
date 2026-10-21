@@ -932,6 +932,8 @@ static int vk_buffer_create(uint32_t slot, int64_t usage, const void *data, int6
     return 1;
 }
 
+static const void *vk_contents(uint32_t slot) { return buffers[slot].mapped; }
+
 /* Uploads (§3): staged now, and copied in a command buffer submitted ahead
    of the next submission. It opens with a barrier on all the work submitted
    before it, orders its copies one after another, and closes with one
@@ -1565,7 +1567,7 @@ static void vk_wait(uint64_t fence) {
 const goose_gpu_backend goose_gpu_vulkan = {
     "vulkan",
     vk_open, vk_close,
-    vk_buffer_create, vk_texture_create, vk_release, vk_view_create, vk_update_buffer,
+    vk_buffer_create, vk_contents, vk_texture_create, vk_release, vk_view_create, vk_update_buffer,
     vk_update_texture,
     vk_generate_mips, vk_copy_to_texture,
     vk_ray_query, vk_accel_create, vk_accel_build, vk_accel_reference,

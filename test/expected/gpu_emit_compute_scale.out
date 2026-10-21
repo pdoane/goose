@@ -154,7 +154,7 @@ kernel void scale_kernel(constant Push &gs_push [[buffer(0)]], device const ulon
         return;
     }
 #line 18 "compute_scale.goose"
-    const int k = (gs_emod_int(((int)(i)), 7) - 3);
+    const int k = as_type<int>(as_type<uint>(int(gs_emod_int(((int)(i)), 7))) - as_type<uint>(int(3)));
 #line 19 "compute_scale.goose"
     uint bits = (i << 3);
 #line 20 "compute_scale.goose"
