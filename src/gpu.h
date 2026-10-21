@@ -271,6 +271,27 @@ struct GpuEmitter {
         return name;
     }
 
+    // Several results, as one struct of them, r0, r1, ...: one per list of
+    // result types, in the value's form.
+    unordered_map<string, string> retnames;
+    string RetStruct(const vector<TypeExpr *> &rets, Line l) {
+        vector<string> tns;
+        string key;
+        for (auto t : rets) {
+            tns.push_back(TypeName(t, l));
+            key += tns.back() + ",";
+        }
+        if (auto it = retnames.find(key); it != retnames.end()) return it->second;
+        string name = "gs_results";
+        for (auto t : rets) name += "_" + Mangle(t);
+        globalnames.insert(name);
+        retnames[key] = name;
+        string body;
+        for (size_t i = 0; i < tns.size(); i++) body += cat("    ", tns[i], " r", i, ";\n");
+        structdefs += cat("struct ", name, " {\n", body, "};\n\n");
+        return name;
+    }
+
     // A fixed array, as a struct around a C array in both dialects: a value
     // that copies, passes and returns as Goose's does, which a bare array
     // does in neither. Its elements take their form in memory, MSL's packed
@@ -936,8 +957,6 @@ struct GpuEmitter {
     string CallX(Call *c) {
         if (c->fvbody || c->trailing) Fail(c, "function values do not run on the GPU yet");
         if (!c->dispatch.empty()) Fail(c, "case functions do not run on the GPU yet");
-        if (c->rettypes.size() > 1)
-            Fail(c, "a call returning several values does not run on the GPU yet");
         auto an = c->ArgNodes();
         if (c->builtin >= 0) {
             switch (c->builtin) {
@@ -991,9 +1010,55 @@ struct GpuEmitter {
         if (sp->sf->isextern) return ExternX(c, sp, an);
         vector<string> args;
         if (msl()) args.push_back("gs");
+        // A writable reference argument is its lvalue (§3 of
+        // design/gpu_language.md): HLSL's inout, MSL's thread reference,
+        // through a copy in and out where MSL's storage is no thread
+        // variable of the type (a packed field, group memory). Two of them
+        // rooted at one variable could tell a copy from an alias.
+        vector<pair<string, string>> writebacks;
+        // Each reference argument's root, and whether the callee writes it.
+        vector<pair<VarDef *, bool>> roots;
         for (size_t i = 0; i < an.size(); i++) {
             auto pt = i < sp->argtypes.size() ? sp->argtypes[i] : nullptr;
-            args.push_back(Convert(X(an[i]), an[i]->exprtype, pt, an[i]->line));
+            if (!pt || pt->kind != TY_REF) continue;
+            auto arg = an[i];
+            if (auto u = Is<Unary>(arg); u && u->op == T_BITAND) arg = u->child;
+            auto root = RootOf(arg);
+            auto writes = WritableRef(pt);
+            for (auto &[v, w] : roots)
+                if (root && v == root && (w || writes))
+                    Fail(arg, cat("two references to ", root->name, " in one call, at least one of them "
+                                  "written, do not run on the GPU: HLSL passes them as copies, which "
+                                  "an alias could tell apart"));
+            roots.push_back({ root, writes });
+        }
+        for (size_t i = 0; i < an.size(); i++) {
+            auto pt = i < sp->argtypes.size() ? sp->argtypes[i] : nullptr;
+            if (!pt || !WritableRef(pt)) {
+                auto at = an[i];
+                if (auto u = Is<Unary>(at); u && u->op == T_BITAND) at = u->child;
+                args.push_back(Convert(X(at), at->exprtype, pt && pt->kind == TY_REF ? pt->ref->sub : pt,
+                                       an[i]->line));
+                continue;
+            }
+            auto arg = an[i];
+            if (auto u = Is<Unary>(arg); u && u->op == T_BITAND) arg = u->child;
+            auto lv = LValue(arg);
+            // MSL stores a vector field or element packed, which no thread
+            // reference of the vector type binds; anything else in thread
+            // memory binds as it is.
+            auto inner = Is<Dot>(arg) || Is<Index>(arg) ||
+                         (Is<Ident>(arg) && fs->aliases.count(Is<Ident>(arg)->vdef) &&
+                          !Is<Ident>(arg)->vdef->isparam);
+            auto plain = !InShared(arg) && !(inner && VecWidth(pt->ref->sub));
+            if (hlsl() || plain) {
+                args.push_back(lv);
+                continue;
+            }
+            auto t = Temp();
+            L(cat(TypeName(pt->ref->sub, arg->line), " ", t, " = ", X(arg), ";"));
+            writebacks.push_back({ lv, t });
+            args.push_back(t);
         }
         auto name = EnsureFn(sp, c->line);
         string r = cat(name, "(");
@@ -1001,9 +1066,31 @@ struct GpuEmitter {
         r += ")";
         if (sp->rets.empty()) {
             L(r + ";");
+            for (auto &[lv, t] : writebacks) L(cat(lv, " = ", t, ";"));
             return "";
         }
-        return r;
+        if (writebacks.empty()) return r;
+        auto res = Temp();
+        L(cat(sp->rets.size() > 1 ? RetStruct(sp->rets, c->line) : TypeName(sp->rets[0], c->line), " ",
+              res, " = ", r, ";"));
+        for (auto &[lv, t] : writebacks) L(cat(lv, " = ", t, ";"));
+        return res;
+    }
+
+    // A reference parameter the callee may write through.
+    static bool WritableRef(const TypeExpr *t) {
+        return t->kind == TY_REF && !t->cq && !t->ref->sub->cq;
+    }
+
+    // The variable an lvalue lies in, null for none.
+    static VarDef *RootOf(Node *n) {
+        for (;;) {
+            if (auto d = Is<Dot>(n); d && d->IsField()) n = d->obj;
+            else if (auto ix = Is<Index>(n)) n = ix->obj;
+            else break;
+        }
+        auto id = Is<Ident>(n);
+        return id ? id->vdef : nullptr;
     }
 
     // An extern on the GPU: a system value (stdlib/gpu_shader.goose), or
@@ -1190,9 +1277,46 @@ struct GpuEmitter {
             }
             case NK_VarDecl: {
                 auto vd = (VarDecl *)n;
-                if (vd->defs.size() != 1)
-                    Fail(n, "a declaration of several values does not run on the GPU yet");
+                if (vd->defs.size() > 1) {
+                    // `let a, b = f();` takes a call's results, `let a, b =
+                    // x, y;` a value each.
+                    if (vd->inits.size() == vd->defs.size()) {
+                        vector<string> vals;
+                        for (size_t i = 0; i < vd->defs.size(); i++)
+                            vals.push_back(Convert(X(vd->inits[i]), vd->inits[i]->exprtype,
+                                                   vd->defs[i]->type, n->line));
+                        for (size_t i = 0; i < vd->defs.size(); i++)
+                            L(cat(TypeName(vd->defs[i]->type, n->line), " ", LocalName(vd->defs[i]), " = ",
+                                  vals[i], ";"));
+                        return;
+                    }
+                    if (vd->inits.size() != 1) Fail(n, "internal: a declaration of several values");
+                    auto call = Is<Call>(vd->inits[0]);
+                    if (!call || call->rettypes.size() != vd->defs.size())
+                        Fail(n, "internal: several values from one initializer");
+                    auto t = Temp();
+                    L(cat(RetStruct(call->rettypes, n->line), " ", t, " = ", X(call), ";"));
+                    for (size_t i = 0; i < vd->defs.size(); i++)
+                        L(cat(TypeName(vd->defs[i]->type, n->line), " ", LocalName(vd->defs[i]), " = ",
+                              Convert(cat(t, ".r", i), call->rettypes[i], vd->defs[i]->type, n->line), ";"));
+                    return;
+                }
                 auto v = vd->defs[0];
+                if (v->type->kind == TY_REF) {
+                    // A reference local names the storage it is bound to.
+                    if (IsOptional(v->type))
+                        Fail(n, "optional references do not run on the GPU yet "
+                                "(design/gpu_language.md §8)");
+                    if (vd->inits.empty()) Fail(n, "internal: a reference without a binding");
+                    auto init = vd->inits[0];
+                    if (auto u = Is<Unary>(init); u && u->op == T_BITAND) init = u->child;
+                    if (!RootOf(init))
+                        Fail(n, "a reference on the GPU is bound to a variable, or a field or "
+                                "element of one");
+                    fs->locals[v] = LValue(init);
+                    fs->aliases.insert(v);
+                    return;
+                }
                 auto tn = TypeName(v->type, n->line);
                 string init;
                 if (!vd->inits.empty())
@@ -1204,6 +1328,9 @@ struct GpuEmitter {
             }
             case NK_Assign: {
                 auto a = (Assign *)n;
+                if (a->op == T_DOTASSIGN)
+                    Fail(n, "rebinding a reference does not run on the GPU yet "
+                            "(design/gpu_language.md §8)");
                 if (a->pointee && !IsAlias(a->lval)) Fail(n, "references do not run on the GPU");
                 auto lv = LValue(a->lval);
                 if (a->op == T_SHLEQ || a->op == T_SHREQ) {
@@ -1322,8 +1449,22 @@ struct GpuEmitter {
                     L("return;");
                     return;
                 }
-                if (r->vals.size() > 1)
-                    Fail(n, "returning several values does not run on the GPU yet");
+                if (fs->spec->rets.size() > 1) {
+                    auto rs = RetStruct(fs->spec->rets, n->line);
+                    if (r->vals.size() == 1) {
+                        L(cat("return ", X(r->vals[0]), ";"));
+                        return;
+                    }
+                    vector<string> vals;
+                    for (size_t i = 0; i < r->vals.size(); i++)
+                        vals.push_back(Convert(X(r->vals[i]), r->vals[i]->exprtype, fs->spec->rets[i],
+                                               n->line));
+                    auto t = Temp();
+                    L(cat(rs, " ", t, ";"));
+                    for (size_t i = 0; i < vals.size(); i++) L(cat(t, ".r", i, " = ", vals[i], ";"));
+                    L(cat("return ", t, ";"));
+                    return;
+                }
                 auto rt = fs->spec->rets.empty() ? nullptr : fs->spec->rets[0];
                 L(cat("return ", Convert(X(r->vals[0]), r->vals[0]->exprtype, rt, n->line), ";"));
                 return;
@@ -1421,12 +1562,29 @@ struct GpuEmitter {
         for (size_t i = 0; i < sp->params.size(); i++) {
             auto v = sp->params[i];
             if (!params.empty()) params += ", ";
-            params += cat(TypeName(v->type, v->line), " ", LocalName(v));
+            auto t = v->type;
+            if (t->kind == TY_REF) {
+                if (IsOptional(t))
+                    Fail(v->line, cat("optional references do not run on the GPU yet "
+                                      "(design/gpu_language.md §8): ", v->name));
+                auto tn = TypeName(t->ref->sub, v->line);
+                if (!WritableRef(t)) {
+                    params += cat(tn, " ", LocalName(v));     // read-only: a copy
+                    continue;
+                }
+                params += hlsl() ? cat("inout ", tn, " ", LocalName(v)) : cat("thread ", tn, "& ", LocalName(v));
+                fs->aliases.insert(v);
+                continue;
+            }
+            params += cat(TypeName(t, v->line), " ", LocalName(v));
         }
-        if (sp->rets.size() > 1)
-            Fail(sp->sf->line, cat(sp->sf->name, " returns several values, which does not run "
-                                   "on the GPU yet"));
-        auto ret = sp->rets.empty() ? string("void") : TypeName(sp->rets[0], sp->sf->line);
+        for (auto t : sp->rets)
+            if (t->kind == TY_REF)
+                Fail(sp->sf->line, cat(sp->sf->name, " returns a reference, which does not run on "
+                                       "the GPU yet (design/gpu_language.md §8)"));
+        auto ret = sp->rets.empty() ? string("void")
+                 : sp->rets.size() > 1 ? RetStruct(sp->rets, sp->sf->line)
+                                       : TypeName(sp->rets[0], sp->sf->line);
         Body(sp);
         fs = outer;
         chain.pop_back();
