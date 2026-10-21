@@ -254,14 +254,13 @@ fn main() {
             wrong++;
         }
     }
-    var rate: u8[>..] = [];
-    format_flt(rate, n / gpums / 1000.0, 0);
-    var gt: u8[>..] = [];
-    format_flt(gt, gpums, 2);
-    var ct: u8[>..] = [];
-    format_flt(ct, cpums, 1);
-    print(gpu::driver(), ": ", n, " pairs in ", tiles, " tiles; GPU ", gt, " ms (", rate,
-          " M pairs/s), CPU ", ct, " ms; ", wrong, " differ");
+    // Throughput of each, in millions of pairs a second.
+    var grate: u8[>..] = [];
+    format_flt(grate, n / gpums / 1000.0, 0);
+    var crate: u8[>..] = [];
+    format_flt(crate, n / cpums / 1000.0, 0);
+    print(gpu::driver(), ": ", n, " pairs in ", tiles, " tiles; GPU ", grate, " M pairs/s, CPU ",
+          crate, " M pairs/s; ", wrong, " differ");
     gpu::close();
     if wrong != 0 { abort("the GPU's sort differs from the CPU's"); }
 }
