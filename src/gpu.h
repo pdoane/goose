@@ -551,6 +551,17 @@ struct GpuEmitter {
         return x;
     }
 
+    // An assignment's target: fields as they are stored, where reading one
+    // would unpack MSL's packed vectors (DotX).
+    string LValue(Node *n) {
+        if (auto d = Is<Dot>(n); d && d->IsField()) {
+            auto ot = d->obj->exprtype;
+            if (ot->kind == TY_REF) ot = ot->ref->sub;
+            return cat(LValue(d->obj), ".", VecWidth(ot) ? string(d->name) : FieldName(d->name));
+        }
+        return X(n);
+    }
+
     string StructLitX(StructLit *s) {
         if (s->einst || s->variant) Fail(s, "enums do not run on the GPU yet");
         auto t = s->exprtype;
@@ -794,7 +805,7 @@ struct GpuEmitter {
             case NK_Assign: {
                 auto a = (Assign *)n;
                 if (a->pointee) Fail(n, "references do not run on the GPU");
-                auto lv = X(a->lval);
+                auto lv = LValue(a->lval);
                 if (a->op == T_SHLEQ || a->op == T_SHREQ) {
                     L(cat(lv, a->op == T_SHLEQ ? " <<= " : " >>= ", ShiftCount(a->rhs), ";"));
                     return;
@@ -814,7 +825,7 @@ struct GpuEmitter {
             }
             case NK_IncDec: {
                 auto i = (IncDec *)n;
-                L(cat(X(i->lval), i->op == T_INC ? "++;" : "--;"));
+                L(cat(LValue(i->lval), i->op == T_INC ? "++;" : "--;"));
                 return;
             }
             case NK_IfExpr: {

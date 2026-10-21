@@ -3,6 +3,8 @@
 // structure, and a compute shader casting a grid of rays down -z with
 // gpu::trace and gpu::trace_any. Every hit is checked against where the
 // squares are: the instance's id, the distance, the triangle, the side.
+// The instances are GPU data: a compute pass writes them, and a barrier
+// into ACCESS_ACCEL_INPUT orders the build after it.
 import gpu from "..";
 import std;
 
@@ -29,6 +31,21 @@ compute(8, 8) fn cast(p: Cast) {
 
 struct Square { x: f32, y: f32, z: f32, id: u32 }
 
+struct Place {
+    squares: gpu::StructuredBuffer<Square>,
+    out: gpu::RWStructuredBuffer<gpu::Instance>,
+    square: uint2,
+    count: u32,
+}
+
+// One instance record per square, written on the GPU.
+compute(64) fn place(p: Place) {
+    let i = gpu::dispatch_thread_id().x;
+    if i >= p.count { return; }
+    let s = gpu::load(p.squares, i);
+    gpu::store(p.out, i, gpu::instance_of(gpu::translate(float3 { s.x, s.y, s.z }), p.square, s.id));
+}
+
 fn main() {
     guard gpu::open_headless() else { abort(str("gpu: ", gpu::error())); }
     guard gpu::ray_query() else {
@@ -48,11 +65,18 @@ fn main() {
     let squares: Square[3] = [Square { x: 0.0, y: 0.0, z: 0.0, id: 10 },
                               Square { x: -1.0, y: -1.0, z: 1.0, id: 20 },
                               Square { x: -1.5, y: -0.5, z: -1.0, id: 30 }];
-    var instances: gpu::Instance[>..] = [];
-    for s in squares {
-        instances.push(gpu::instance(gpu::translate(float3 { s.x, s.y, s.z }), square, s.id));
-    }
-    let ibuf = gpu::buffer(gpu::BUFFER_READ, bytes_of(instances));
+    let sbuf = gpu::buffer(gpu::BUFFER_READ, bytes_of(squares));
+    let ibuf = gpu::buffer(gpu::BUFFER_WRITE, 3 * 72);
+    let placer = gpu::compute_pipeline(place);
+    gpu::begin_compute();
+    gpu::bind(placer);
+    gpu::push_constants(Place { squares: gpu::structured<Square>(sbuf),
+                                out: gpu::rw_structured<gpu::Instance>(ibuf),
+                                square: gpu::reference(square), count: 3 });
+    gpu::dispatch(1, 1, 1);
+    gpu::end_compute();
+    // The build reads what the pass wrote: the program's barrier says so.
+    gpu::barrier(ibuf, gpu::ACCESS_SHADER_WRITE, gpu::ACCESS_ACCEL_INPUT);
     let scene = gpu::instance_accel(gpu::InstanceAccelDesc { instances: ibuf, max: 3 });
     gpu::build(square);
     gpu::build(scene, 3);

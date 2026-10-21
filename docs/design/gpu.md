@@ -732,12 +732,43 @@ texture, through push constants or a buffer.
 
 `gpu::Instance` is one portable record: a row-major 3x4 transform, then
 options, a mask, an intersection table offset (unused), a user id and the
-primitive structure's reference (`gpu::reference`), 72 bytes. That is
-Metal's indirect instance descriptor read with a row-major transform, which
-Metal 4 builds from directly; Direct3D 12 and Vulkan have a 64-byte record
-of their own, which their backends convert with a compute pass recorded
-ahead of the build. Instances are GPU data: a culling compute pass writes
-them as readily as the host does.
+primitive structure's reference, its low word first (`gpu::reference`
+gives it as a `uint2`), 72 bytes. That is Metal's indirect instance
+descriptor read with a row-major transform, which Metal 4 builds from
+directly. It holds no 64-bit integer, so it is in the GPU subset: a culling
+pass writes instances as readily as the host does (`gpu::instance_of`).
+
+Direct3D 12 and Vulkan take a 64-byte record of their own, so their
+backends convert. Shaders never read the converted records: the build is
+their only reader, and the build is a host call naming its instance buffer,
+so the package knows exactly when the read happens and records all of it
+itself. `build` records, in order:
+
+1. A conversion dispatch reading the program's `gpu::Instance` buffer and
+   writing a native-layout buffer the package owns. That buffer is not in
+   the heap, so nothing else can reach it, and the reference is copied
+   through: on those backends `gpu::reference` is the structure's device
+   address.
+2. A barrier from that compute write to acceleration-structure build input.
+3. The build, reading the native buffer by device address.
+4. A barrier from the build's write to acceleration-structure reads, which
+   is what every later trace needs.
+
+The native buffer's hazards are the package's: the next build's
+conversion would overwrite records the previous build may still be
+reading, so each conversion starts with a barrier from build reads to
+compute writes (or the package rotates buffers by fence).
+
+What the package cannot know is when the program's own GPU work has
+finished writing the instances, or a primitive structure's vertices and
+indices: bindless means it never sees those writes. That ordering is the
+program's, as for any resource its GPU work writes (§3), through the access
+`ACCESS_ACCEL_INPUT`: `barrier(instances, ACCESS_SHADER_WRITE,
+ACCESS_ACCEL_INPUT)` before `build`. Vulkan and Direct3D 12 map it to
+compute-shader reads and build reads, covering the conversion; Metal keeps
+it by its encoders' barriers. Instances the host writes with
+`update_buffer` need no barrier, since uploads complete before the
+submission holding the build.
 
 On the GPU:
 
@@ -852,8 +883,11 @@ Each phase lands as working commits with its tests.
    order with the work around them. `packages/gpu/test/rays.goose` casts
    64 rays at three instances of one square and checks every hit's
    instance, distance, triangle and side, on Metal under validation.
-   KosmicKrisp has no ray queries yet, so Vulkan reports none; its build
-   path and the instance conversion wait for a driver that has them.
+   The test's instances are written by a compute pass and ordered before
+   the build by a barrier into `ACCESS_ACCEL_INPUT`, so the contract the
+   conversion needs is exercised on Metal already. KosmicKrisp has no ray
+   queries yet, so Vulkan reports none; its build path and the instance
+   conversion wait for a driver that has them.
 5. **A frame graph, written in Goose**: passes that declare what they read
    and write, barriers and transient memory derived from that, unused passes
    pruned. Whether Goose's provenance analysis can reject a stale resource

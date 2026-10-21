@@ -51,6 +51,9 @@ enum {
     GOOSE_GPU_ACCESS_COPY_SRC = 32,
     GOOSE_GPU_ACCESS_COPY_DST = 64,
     GOOSE_GPU_ACCESS_PRESENT = 128,     /* the screen's, when frame() shows it */
+    /* What an acceleration structure's build reads (§7): where a backend
+       converts instances first, its conversion's reads too. */
+    GOOSE_GPU_ACCESS_ACCEL_INPUT = 256,
 };
 
 #pragma pack(push, 1)

@@ -159,6 +159,36 @@ struct Hit {
     barycentrics: float2,
 }
 
+// One instance of a primitive acceleration structure, as an instance one
+// holds it, whether the host writes it or a shader does: where the
+// transform's rows put it, the id gpu::Hit reports, the mask a ray's must
+// share a bit with, and the structure's reference (gpu::reference), its
+// low word first. 72 bytes, Metal's indirect instance descriptor with a
+// row-major transform (docs/design/gpu.md §7).
+struct Instance {
+    row0: float4,
+    row1: float4,
+    row2: float4,
+    flags: u32 = 4,         // INSTANCE_OPAQUE
+    mask: u32 = 255,
+    table: u32 = 0,
+    id: u32 = 0,
+    accel: uint2,
+}
+
+let INSTANCE_CULL_DISABLE: u32 = 1;
+let INSTANCE_FRONT_COUNTERCLOCKWISE: u32 = 2;
+let INSTANCE_OPAQUE: u32 = 4;
+
+// An instance of the structure `accel` refers to, placed by m, the 3x4 rows
+// of the column-major mat4.
+fn instance_of(m: mat4, accel: uint2, id: u32) -> Instance {
+    Instance { row0: float4 { m.c0.x, m.c1.x, m.c2.x, m.c3.x },
+               row1: float4 { m.c0.y, m.c1.y, m.c2.y, m.c3.y },
+               row2: float4 { m.c0.z, m.c1.z, m.c2.z, m.c3.z },
+               flags: INSTANCE_OPAQUE, mask: 255, table: 0, id: id, accel: accel }
+}
+
 extern "gs_shader_trace" fn trace(a: Accel, r: Ray, mask: u32) -> Hit;
 // Whether anything is hit, ending at the first: for shadows and occlusion.
 extern "gs_shader_trace_any" fn trace_any(a: Accel, r: Ray, mask: u32) -> bool;

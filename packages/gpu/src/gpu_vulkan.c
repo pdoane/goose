@@ -235,6 +235,11 @@ static vkaccess access_of(int a) {
         case GOOSE_GPU_ACCESS_COPY_DST:
             return (vkaccess) { VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL };
+        case GOOSE_GPU_ACCESS_ACCEL_INPUT:
+            /* The build's reads, and the instance conversion's before it. */
+            return (vkaccess) { VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED };
         case GOOSE_GPU_ACCESS_PRESENT:
             return (vkaccess) { VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
                                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR };
