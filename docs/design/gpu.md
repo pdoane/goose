@@ -938,6 +938,12 @@ Each phase lands as working commits with its tests.
    conversion needs is exercised on Metal already. KosmicKrisp has no ray
    queries yet, so Vulkan reports none; its build path and the instance
    conversion wait for a driver that has them.
+   `packages/gpu/examples/gltf/pathtrace.goose` path traces glTF scenes
+   with the viewer's materials: a structure per primitive, instances
+   naming theirs by id, each hit's triangle and material read through the
+   scene's buffers and bindless material table, the sun sampled with
+   shadow rays that pass alpha-masked texels, and GGX and diffuse lobes
+   drawn by their combined density.
 5. **A frame graph, written in Goose**: passes that declare what they read
    and write, barriers and transient memory derived from that, unused passes
    pruned. Whether Goose's provenance analysis can reject a stale resource

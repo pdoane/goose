@@ -23,7 +23,15 @@ struct Refs {
 
 // A draw: an instance of a primitive, with what choosing its pipeline and
 // order needs.
-struct Draw { instance: u32, first_index: u32, index_count: u32, material: u32, flags: u32, center: float3 }
+struct Draw {
+    instance: u32,
+    first_index: u32,
+    index_count: u32,
+    material: u32,
+    flags: u32,
+    center: float3,
+    world: gpu::mat4,
+}
 
 struct Model {
     refs: Refs,
@@ -106,7 +114,8 @@ fn load(path: const u8[:], out: Model&) -> u8[>..] {
     for i in insts.len {
         let p = prims[insts[i].prim];
         out.draws.push(Draw { instance: i as u32, first_index: p.first_index, index_count: p.index_count,
-                              material: p.material, flags: p.flags, center: insts[i].center });
+                              material: p.material, flags: p.flags, center: insts[i].center,
+                              world: insts[i].world });
     }
     str("")
 }
