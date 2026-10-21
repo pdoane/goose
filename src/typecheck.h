@@ -2266,6 +2266,7 @@ struct TypeCheck {
     Val CallResult(Call *c, FnSpec *spec, vector<Val> &argvals);
     void CheckReturn(Return *r);
     FnSpec *EnsureThreadSpec(SFunction *sf, Line l);
+    FnSpec *EnsureGpuSpec(SFunction *sf, Line l);
 
     // ------------------------------------------------------------------
     // Struct and variant literals (§4.2). The per-node entry is
@@ -2928,6 +2929,8 @@ struct TypeCheck {
         for (size_t i = 0; i < ast.functions.size(); i++) {
             auto sf = ast.functions[i];
             if (sf->isthread) CheckRoot([&] { EnsureThreadSpec(sf, sf->line); });
+            // GPU entry points likewise (docs/design/gpu.md §5.2).
+            if (sf->gpustage >= 0) CheckRoot([&] { EnsureGpuSpec(sf, sf->line); });
         }
         // Thread programs may not touch globals: that would be shared mutable
         // memory between programs (§11.2).
@@ -3015,7 +3018,9 @@ struct TypeCheck {
     }
 
     void CheckUnreached(SFunction *sf) {
-        if (!sf->specs.empty() || sf->isthread || sf->isnested || sf->brokensig) return;
+        if (!sf->specs.empty() || sf->isthread || sf->gpustage >= 0 || sf->isnested ||
+            sf->brokensig)
+            return;
         if (!sf->generics.empty()) return;
         for (auto &p : sf->params) if (!p.type) return;
         set<string_view> names = { sf->name };
@@ -3042,7 +3047,8 @@ struct TypeCheck {
     void CheckExemplars() {
         vector<SFunction *> todo;
         for (auto sf : ast.functions) {
-            if (!sf->specs.empty() || sf->isthread || sf->isnested || sf->isextern || !sf->body)
+            if (!sf->specs.empty() || sf->isthread || sf->gpustage >= 0 || sf->isnested ||
+                sf->isextern || !sf->body)
                 continue;
             auto generic = !sf->generics.empty();
             for (auto &p : sf->params) generic = generic || !p.type;

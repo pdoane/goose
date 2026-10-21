@@ -62,6 +62,13 @@ inline string FnHeader(const SFunction *sf) {
     if (sf->isinline) s += "inline ";
     if (sf->issimd) s += "simd ";
     if (sf->isrec) s += "recursive ";
+    if (sf->gpustage >= 0) {
+        s += GpuStageName(sf->gpustage);
+        auto &g = sf->groupsize;
+        if (sf->gpustage == GPU_COMPUTE && (g[0] != 1 || g[1] != 1 || g[2] != 1))
+            s += cat("(", g[0], ", ", g[1], ", ", g[2], ")");
+        s += " ";
+    }
     s += sf->isthread ? "thread_fn " : "fn ";
     Append(s, sf->qname, GenericsText(sf->generics), "(");
     for (size_t i = 0; i < sf->params.size(); i++) {

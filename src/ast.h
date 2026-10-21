@@ -1103,6 +1103,7 @@ NODE(Call)
     bool poolcheck = false;
     TypeExpr *qtype = nullptr;  // qlimit<T>: T, which names the queue (§11.2).
     const string *shaderblob = nullptr;  // embed_shader's compiled blob or embed_file's bytes, in Ast::shaders.
+    FnSpec *gpuspec = nullptr;   // gpu_entry's entry point (docs/design/gpu.md §6).
     Call(Line l, Node *_callee) : Node(l, NKind), callee(_callee) {}
     // What the call passes for the callee's free variable v (fvremap).
     VarDef *FreeVarArg(VarDef *v) const {
@@ -1432,6 +1433,15 @@ NODE_END
 // Symbols (top-level declarations). Wrapped in decl nodes so a module's
 // top-level items keep source order for dumping.
 
+// The stage of a GPU entry point (docs/design/gpu.md §5.1), numbered as the
+// shader library numbers them (src/gpu_library.h).
+enum GpuStage { GPU_VERTEX, GPU_FRAGMENT, GPU_COMPUTE };
+
+inline const char *GpuStageName(int s) {
+    static const char *names[] = { "vertex", "fragment", "compute" };
+    return names[s];
+}
+
 struct SFunction {
     string_view name;           // The leaf name, as lexical lookups and diagnostics use it.
     string_view ns;             // Its namespace, "" for the global one (docs/design/namespaces.md).
@@ -1450,6 +1460,11 @@ struct SFunction {
     // check left in any copy of the body is an error (bce.h).
     bool checkfree = false;
     bool isthread = false;
+    // A GPU entry point (docs/design/gpu.md §5.1): `vertex fn`, `fragment
+    // fn` or `compute(x, y, z) fn`, a GPU_* stage; -1 for any other
+    // function. groupsize is a compute entry's threadgroup size.
+    int gpustage = -1;
+    int groupsize[3] = { 1, 1, 1 };
     bool isextern = false;      // A C function behind a Goose signature (§7.10); no body.
     bool isexport = false;      // A Goose function exposed through a C ABI wrapper.
     string cname;               // Its C symbol (the Goose name unless spelled out).
@@ -2405,6 +2420,10 @@ struct Ast {
     // calling it, a shader given as source by that file, stage and source.
     // And embed_file's bytes, by "file\n" and the path, read the same way.
     map<string, string> shaders;
+    // The gpu_entry calls (docs/design/gpu.md §6), whose entry points the
+    // GPU pass (src/gpu.h) compiles after typechecking, setting each one's
+    // shaderblob to its library in `shaders`.
+    vector<Call *> gpucalls;
 
     // Every checked tree that runs outside a function body: the global
     // initializers. `f` gets the slot, so a pass that rewrites trees can

@@ -49,6 +49,7 @@
 #include "packages.h"
 #include "json.h"
 #include "native.h"
+#include "gpu.h"
 #include "lsp_rpc.h"
 #include "lsp_analysis.h"
 #include "lsp_workspace.h"
@@ -840,6 +841,8 @@ Options:
                         declarations, fields and variants.
   --dump-file out       Write that dump to a file, and go on.
   --roundtrip           Check that the dump parses and dumps back to itself.
+  --emit-shaders dir    Write the HLSL and MSL the GPU entry points compile from
+                        to dir, one file per entry point and dialect.
   --multi-test file...  Compile each file as a run of its own would, ending what
                         each printed with a line on stdout and on stderr:
                         `)", MULTIMARK, R"( <code> <file>`.
@@ -1017,6 +1020,7 @@ int Main(int argc, char **argv) {
     }
     if (verb == "lsp") return RunLsp(exe, vector<string>(argv + firstarg, argv + argc));
     string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile;
+    GpuCompileOptions gpuopts;
     auto dump = false, dumpdocs = false, tokens = false, parseonly = false, specs = false;
     auto nocgen = false;
     auto roundtrip = false, multitest = false;
@@ -1088,6 +1092,8 @@ int Main(int argc, char **argv) {
         // Hidden: what a shader compiles to, without a program around it.
         else if (arg == "--compile-shader" && i + 1 < argc) shaderfile = argv[++i];
         else if (arg == "--shader-source" && i + 1 < argc) shadersource = argv[++i];
+        // The HLSL and MSL the GPU functions emit (docs/design/gpu.md §6).
+        else if (arg == "--emit-shaders" && i + 1 < argc) gpuopts.emitdir = argv[++i];
         // `--<name>-link msvc|cc`: the response file of a blessed package
         // compiled into this compiler (builtin.h).
         else if (arg.size() > 7 && arg.rfind("--", 0) == 0 &&
@@ -1282,6 +1288,11 @@ int Main(int argc, char **argv) {
         if (parseonly) return 0;
         TypeCheckProgram(ast, library, nocgen);
         // The checker reported the errors it went on past, root by root.
+        if (!ast.errors.empty()) return 1;
+        // GPU entry points compile as programs of their own, before the
+        // optimizer rewrites the bodies they share with the CPU's.
+        gpuopts.compile = !nocgen;
+        CompileGpuEntries(ast, gpuopts);
         if (!ast.errors.empty()) return 1;
         Optimizer opt(ast, optlevel);
         if (specs) {

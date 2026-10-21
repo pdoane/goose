@@ -114,7 +114,7 @@ struct Parser {
             case T_RETURN: case T_BREAK: case T_CONTINUE:
                 return !declaration;
             default:
-                return AtInline() || AtCheckfree();
+                return AtInline() || AtCheckfree() || (declaration && AtGpuStage());
         }
     }
 
@@ -258,6 +258,19 @@ struct Parser {
                next == T_EXTERN || next == T_IDENT;
     }
 
+    // A GPU entry point's stage, `vertex fn`, `fragment fn`, `compute fn` or
+    // `compute(x, y, z) fn` (docs/design/gpu.md §5.1): names everywhere
+    // else, and only at the top level, where a name cannot start anything.
+    bool AtGpuStage() {
+        if (lex.tok != T_IDENT) return false;
+        auto next = lex.PeekTok();
+        // `recursive` and `thread_fn` after one are declaration errors.
+        auto decl = next == T_FN || next == T_RECURSIVE || next == T_THREADFN;
+        if (lex.attr == "vertex" || lex.attr == "fragment") return decl;
+        if (lex.attr == "compute") return decl || next == T_LPAREN;
+        return false;
+    }
+
     void Expect(TType t, const char *context) {
         if (lex.tok != t)
             Error(cat("expected \'", TName(t), "\' in ", context, ", found \'", TokStr(), "\'"));
@@ -397,7 +410,7 @@ struct Parser {
             default: break;
         }
         declseen = true;
-        if (AtInline() || AtCheckfree()) goto fndecl;
+        if (AtInline() || AtCheckfree() || AtGpuStage()) goto fndecl;
         switch (lex.tok) {
             case T_STRUCT: ParseStructDecl(); return;
             case T_ENUM:   ParseEnumDecl();   return;
@@ -573,6 +586,26 @@ struct Parser {
         ast.topdecls.push_back(Finish(New<EnumDecl>(line, en)));
     }
 
+    // `vertex`, `fragment` or `compute`, with a compute entry's group size:
+    // one to three positive integer constants, the rest 1.
+    void ParseGpuStage(SFunction *sf) {
+        auto stage = lex.attr;
+        lex.Next();
+        sf->gpustage = stage == "vertex" ? GPU_VERTEX : stage == "fragment" ? GPU_FRAGMENT
+                                                                         : GPU_COMPUTE;
+        if (sf->gpustage != GPU_COMPUTE || !IsNext(T_LPAREN)) return;
+        for (int k = 0;; k++) {
+            if (k == 3) Error("compute takes at most three group sizes, x, y and z");
+            if (lex.tok != T_INTLIT || lex.ival <= 0 || lex.ival > 1024)
+                Error(cat("a compute group size is an integer from 1 to 1024, not '", TokStr(),
+                          "'"));
+            sf->groupsize[k] = (int)lex.ival;
+            lex.Next();
+            if (!IsNext(T_COMMA)) break;
+        }
+        Expect(T_RPAREN, "compute group size");
+    }
+
     FnDecl *ParseFnDecl(bool nested) {
         auto firsttype = ast.alltypes.size();
         auto line = CurLine();
@@ -626,8 +659,14 @@ struct Parser {
             sf->isinline = true;
             lex.Next();
         }
+        if (!nested && AtGpuStage()) ParseGpuStage(sf);
         sf->isrec = IsNext(T_RECURSIVE);
         if (sf->isinline && sf->isrec) Error("recursive fn cannot be inline");
+        if (sf->gpustage >= 0 && (sf->isexport || sf->isextern || sf->issimd || sf->isinline ||
+                                  sf->isrec || lex.tok == T_THREADFN))
+            Error(cat(GpuStageName(sf->gpustage), " fn is a GPU entry point, and cannot also be ",
+                      sf->isexport ? "export" : sf->isextern ? "extern" : sf->issimd ? "simd" :
+                      sf->isinline ? "inline" : sf->isrec ? "recursive" : "a thread_fn"));
         if (lex.tok == T_THREADFN) {
             if (sf->isinline) Error("thread_fn cannot be inline");
             sf->isthread = true;

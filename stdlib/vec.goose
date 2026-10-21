@@ -19,6 +19,9 @@ type double4 = vec4<f64>;
 type int2 = vec2<i32>;
 type int3 = vec3<i32>;
 type int4 = vec4<i32>;
+type uint2 = vec2<u32>;
+type uint3 = vec3<u32>;
+type uint4 = vec4<u32>;
 
 let float2_0 = float2 { 0.0, 0.0 };
 let float2_1 = float2 { 1.0, 1.0 };
@@ -38,6 +41,12 @@ let int3_0 = int3 { 0, 0, 0 };
 let int3_1 = int3 { 1, 1, 1 };
 let int4_0 = int4 { 0, 0, 0, 0 };
 let int4_1 = int4 { 1, 1, 1, 1 };
+let uint2_0 = uint2 { 0, 0 };
+let uint2_1 = uint2 { 1, 1 };
+let uint3_0 = uint3 { 0, 0, 0 };
+let uint3_1 = uint3 { 1, 1, 1 };
+let uint4_0 = uint4 { 0, 0, 0, 0 };
+let uint4_1 = uint4 { 1, 1, 1, 1 };
 
 fn dot<T>(a: vec2<T>, b: vec2<T>) -> T { a.x * b.x + a.y * b.y }
 fn dot<T>(a: vec3<T>, b: vec3<T>) -> T { a.x * b.x + a.y * b.y + a.z * b.z }

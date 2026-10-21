@@ -78,6 +78,9 @@ and the reference describe what was built; these say why.
   checker's analyses and options for simplifying them.
 * [Column arrays](design/soa.md): a struct-of-arrays storage proposal, not
   implemented.
+* [A modern GPU stack](design/gpu.md): a bindless `gpu` package with ray
+  queries, and shaders written as Goose functions; a proposal, not
+  implemented.
 * [WebAssembly](design/wasm.md): running without address-space reservation,
   fixed partitions against relocating stacks; a proposal.
 

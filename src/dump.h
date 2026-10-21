@@ -648,6 +648,13 @@ inline void FnDecl::Dump(string &s, int ind) const {
     if (sf->issimd) s += "simd ";
     if (sf->isinline) s += "inline ";
     if (sf->isrec) s += "recursive ";
+    if (sf->gpustage >= 0) {
+        s += GpuStageName(sf->gpustage);
+        auto &g = sf->groupsize;
+        if (sf->gpustage == GPU_COMPUTE && (g[0] != 1 || g[1] != 1 || g[2] != 1))
+            s += cat("(", g[0], ", ", g[1], ", ", g[2], ")");
+        s += " ";
+    }
     s += sf->isthread ? "thread_fn " : "fn ";
     s += sf->isnested ? sf->name : sf->qname;   // See VarDecl::Dump.
     DumpGenerics(s, sf->generics);

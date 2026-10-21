@@ -142,6 +142,66 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             }
             return first;
         }
+        case B_GPU_ENTRY: {
+            // gpu_entry(f): the shader library holding the GPU entry point f,
+            // compiled after typechecking (src/gpu.h). f is named as
+            // thread_spawn names its worker, a function parameter bound to
+            // one included (docs/design/gpu.md §5.1).
+            auto eid = Is<Ident>(args[0]);
+            SFunction *esf = nullptr;
+            auto evd = eid ? LookupVar(eid->name, eid->ns) : nullptr;
+            if (eid && !(evd && !evd->isglobal) && !ScopeNameKind(eid->name))
+                for (auto sf : ast.LookupFunctions(eid->name, eid->ns))
+                    if (sf->gpustage >= 0) esf = sf;
+            const FnValBind *fvb = nullptr;
+            if (eid && !(evd && !evd->isglobal) &&
+                !LookupTypeParam(eid->name, fvb) && fvb && fvb->named) {
+                if (fvb->set) {
+                    for (auto sf : *fvb->set) if (sf->gpustage >= 0) esf = sf;
+                } else if (fvb->named->gpustage >= 0) {
+                    esf = fvb->named;
+                }
+            }
+            if (!esf)
+                Error(c, "gpu_entry's argument names a GPU entry point: a vertex, fragment or "
+                         "compute fn");
+            eid->fnref = esf;
+            eid->exprtype = fntype;
+            c->gpuspec = EnsureGpuSpec(esf, c->line);
+            ast.gpucalls.push_back(c);
+            c->rettypes.push_back(cu8slice);
+            Val v;
+            v.type = cu8slice;
+            v.Set(nullptr, true);   // Static data, as embed_shader's.
+            v.writable = false;
+            return v;
+        }
+        case B_GPU_LOAD: {
+            // gpu_load<T>(buffer, i): element i of a buffer of T, given by
+            // its heap index, at T's packed size apart and in its Goose
+            // layout. GPU code only (docs/design/gpu.md §5.3).
+            if (c->tyargs.size() != 1)
+                Error(c, "gpu_load<T>(buffer, i) needs exactly one explicit type argument");
+            auto t = Subst(c->tyargs[0]);
+            ValidateType(t, c->line, VT_LOCAL);
+            if (!IsFlat(t)) Error(c, cat("gpu_load reads a flat value, not ", TypeStr(t)));
+            CheckArg(args[0], ast.inttypes[IS_U32]);
+            CheckArg(args[1], ast.inttypes[IS_U32]);
+            c->rettypes.push_back(t);
+            Val v;
+            v.type = t;
+            return v;
+        }
+        case B_GPU_STORE: {
+            // gpu_store(buffer, i, value): the mirror of gpu_load.
+            CheckArg(args[0], ast.inttypes[IS_U32]);
+            CheckArg(args[1], ast.inttypes[IS_U32]);
+            auto vv = CheckValue(args[2], nullptr);
+            NoUntypedEmptyArray(vv, args[2], d.name);
+            if (vv.type->kind == TY_VOID || vv.type->kind == TY_FN || !IsFlat(vv.type))
+                Error(c, cat("gpu_store writes a flat value, not ", TypeStr(vv.type)));
+            return VoidVal();
+        }
         case B_EMBED_SHADER:
         case B_EMBED_FILE: {
             // The shader compiled, or the file read, now, and the result a

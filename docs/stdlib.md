@@ -515,7 +515,8 @@ if c { c.v += 1; }
 struct vec2<T> { x: T, y: T }       struct vec3<T> { x: T, y: T, z: T }
 struct vec4<T> { x: T, y: T, z: T, w: T }
 type float2/float3/float4 = vec*<f32>   double2/3/4 = vec*<f64>   int2/3/4 = vec*<i32>
-let float3_0 = float3 { 0.0, 0.0, 0.0 };  // _0 and _1 for all nine aliases
+type uint2/3/4 = vec*<u32>
+let float3_0 = float3 { 0.0, 0.0, 0.0 };  // _0 and _1 for all twelve aliases
 
 fn dot<T>(a: vec3<T>, b: vec3<T>) -> T          // all sizes
 fn cross<T>(a: vec3<T>, b: vec3<T>) -> vec3<T>
@@ -534,6 +535,30 @@ also broadcast a scalar in either order: `v * 2.0`, `v / length(v)`,
 scalar converts to the component type, so an `f64` variable scaling a
 `float3` needs an explicit `as f32`. Per-component
 `min`/`max` is written out (`min(a.x, b.x)`).
+
+## gpu_shader
+
+What a GPU function reaches beyond the language, in namespace `gpu`
+([design/gpu.md](design/gpu.md) §5): the system values and the buffer
+handles. A function declared `compute(x, y, z) fn` is a GPU entry point,
+compiled when the program is, and `gpu_entry(f)` is its shader library, a
+`const u8[:]` the `gpu` package makes a pipeline from.
+
+```goose
+fn dispatch_thread_id() -> uint3     fn group_id() -> uint3     // compute entry points
+fn group_thread_id() -> uint3        fn group_index() -> u32
+fn vertex_index() -> u32             fn instance_index() -> u32 // vertex entry points
+struct StructuredBuffer<T> { index: u32 }      struct RWStructuredBuffer<T> { index: u32 }
+fn load<T>(b: StructuredBuffer<T>, i: u32) -> T      // and an RWStructuredBuffer<T>
+fn store<T>(b: RWStructuredBuffer<T>, i: u32, v: T)
+```
+
+A buffer handle is its index in the resource heap, and its elements are T
+in T's Goose layout, T's packed size apart. These run in GPU functions
+only: a call reached from code the CPU runs is a compile error. GPU
+functions compute in `i32`, `u32`, `f32` and `bool`, with `vec`'s vectors
+of them, structs and the control flow of the language; what else they may
+not do yet is the design note's §5.2.
 
 ## math
 

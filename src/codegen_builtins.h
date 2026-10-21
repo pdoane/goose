@@ -119,8 +119,12 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
             return { tv };
         }
         case B_HARDWARE_THREADS: return { "gs_hardware_threads()" };
+        case B_GPU_LOAD: case B_GPU_STORE:
+            Fail(c->line, cat(BuiltinByKind(c->builtin).name, " runs on the GPU only, and this call is "
+                              "reached from code the CPU runs (docs/design/gpu.md §5.2)"));
         case B_EMBED_SHADER:
-        case B_EMBED_FILE: {
+        case B_EMBED_FILE:
+        case B_GPU_ENTRY: {
             auto &blob = *c->shaderblob;
             auto t = T();
             L(CT(c->rettypes[0]), " ", t, " = { ", BlobRaw(blob), ", ", blob.size(), " };");

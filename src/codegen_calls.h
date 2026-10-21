@@ -92,6 +92,11 @@ inline void CodeGen::EmitCallInto(Call *c, vector<Dst> &dsts) {
 // in its C type, no calling-convention extras; a fixed result lands in
 // a temporary like any other C value.
 inline vector<string> CodeGen::EmitExternCall(Call *c, FnSpec *sp) {
+    // The GPU's intrinsics are declared as externs under gs_shader_ names
+    // (stdlib/gpu_shader.goose), which nothing on the CPU defines.
+    if (sp->sf->cname.starts_with("gs_shader_"))
+        Fail(c->line, cat(sp->sf->name, " runs on the GPU only, and this call is reached from "
+                          "code the CPU runs (docs/design/gpu.md §5.2)"));
     if (std::find(usedexterns.begin(), usedexterns.end(), sp) == usedexterns.end())
         usedexterns.push_back(sp);
     auto an = CallArgNodes(c, sp->argtypes.size());

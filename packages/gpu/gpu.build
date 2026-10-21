@@ -1,0 +1,3 @@
+// The gpu package's native part: its CMake target (CMakeLists.txt).
+cmake_target = "goose_gpu";
+exclude = ["test"];

@@ -75,6 +75,10 @@ inline Val TypeCheck::CheckNamedCall(Call *c, Ident *id, TypeExpr *expected) {
             if (sf->isthread)
                 Error(c, cat("thread_fn ", id->name, " is spawned with thread_spawn, "
                              "not called"));
+        for (auto sf : cands)
+            if (sf->gpustage >= 0)
+                Error(c, cat(GpuStageName(sf->gpustage), " fn ", id->name,
+                             " is a GPU entry point: a pipeline runs it, nothing calls it"));
         Node *nopre = nullptr;
         // A user function set sharing a builtin's name (a `format`
         // overload, §3.7) takes the calls it matches; the builtin the rest.
@@ -3495,6 +3499,43 @@ inline FnSpec *TypeCheck::EnsureThreadSpec(SFunction *sf, Line l) {
         ValidateType(t, sf->line, VT_PARAM);
         if (!IsFlat(t))
             Error(l, cat("thread_fn parameters must be flat (§11.2), not ", TypeStr(t)));
+        spec->argtypes.push_back(t);
+    }
+    spec->roots.resize(spec->argtypes.size());
+    RootArg noview;
+    noview.cls = -1;
+    spec->views.resize(spec->argtypes.size(), noview);
+    sf->specs.push_back(spec);
+    CheckSpecBody(spec, nullptr, l);
+    return spec;
+}
+
+// A GPU entry point's one specialization, made the first time gpu_entry
+// names it or the checker reaches it unnamed, as a thread_fn's is. Its
+// parameters are fully typed and flat, or a uniform block's `const T&`
+// (docs/design/gpu.md §5.1); what its body may do is the GPU pass's to
+// check (src/gpu.h).
+inline FnSpec *TypeCheck::EnsureGpuSpec(SFunction *sf, Line l) {
+    if (sf->brokensig) throw Abandoned {};
+    if (!sf->specs.empty()) {
+        if (sf->specs[0]->failed) throw Abandoned {};
+        return sf->specs[0];
+    }
+    auto what = cat(GpuStageName(sf->gpustage), " fn ", sf->name);
+    if (!sf->generics.empty()) Error(l, cat(what, " cannot be generic"));
+    if (sf->gpustage == GPU_COMPUTE && sf->has_rets)
+        Error(l, cat(what, " cannot return values: a compute entry point writes buffers"));
+    auto spec = ast.NewFnSpec();
+    spec->sf = sf;
+    for (auto &p : sf->params) {
+        if (!p.type) Error(l, cat(what, " needs fully typed parameters"));
+        auto t = Subst(p.type);
+        ValidateType(t, sf->line, VT_PARAM);
+        auto uniform = t->kind == TY_REF && t->ref->sub->cq && IsPlainRef(t) &&
+                       IsFlat(t->ref->sub);
+        if (!uniform && !IsFlat(t))
+            Error(l, cat(what, "'s parameters are flat values, or a uniform block's const T&, "
+                               "not ", TypeStr(t)));
         spec->argtypes.push_back(t);
     }
     spec->roots.resize(spec->argtypes.size());
