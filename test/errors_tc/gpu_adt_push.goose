@@ -1,4 +1,4 @@
-// error: push constants holding an ADT do not run on the GPU yet: read it from a buffer
+// error: push constants holding an ADT or a limited array do not run on the GPU yet: read it from a buffer
 import gpu_shader;
 enum Light { Point { power: f32 }, Sun }
 struct P { light: Light, out: gpu::RWStructuredBuffer<f32> }

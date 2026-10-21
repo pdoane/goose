@@ -64,7 +64,8 @@ tables of literals, group memory (`gpu::GroupShared<T>`), barriers,
 atomics and wave operations; references as parameters and locals (§3),
 multiple returns and `return … from` (§4); fixed-mode ADTs, `match` and
 case functions, with ADTs read from buffers in Goose's packed layout (§5);
-faults (§6), with `packages/gpu/test/faults.goose` triggering each kind.
+faults (§6), with `packages/gpu/test/faults.goose` triggering each kind;
+and limited arrays (§7), read from buffers as Goose packs them.
 `packages/gpu/test/language.goose` runs one function over all of them on
 the GPU and the CPU and compares the results, and the glTF path tracer's
 materials are an ADT (`Bsdf`, opaque or glass with volume absorption)

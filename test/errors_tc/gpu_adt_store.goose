@@ -1,4 +1,4 @@
-// error: storing an ADT into a buffer does not run on the GPU yet: Goose packs its payload after the tag's byte, and a GPU writes whole words, which neighbouring elements would share (design/gpu_language.md §5)
+// error: storing an ADT or a limited array into a buffer does not run on the GPU yet: Goose packs what follows its tag or length unaligned, and a GPU writes whole words, which neighbouring elements would share (design/gpu_language.md §5)
 import gpu_shader;
 enum Light { Point { power: f32 }, Sun }
 struct P { out: gpu::RWStructuredBuffer<Light> }

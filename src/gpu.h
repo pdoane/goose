@@ -133,12 +133,27 @@ struct GpuEmitter {
         return t->kind == TY_STRUCT && t->struc->st && t->struc->st->qname == "gpu::GroupShared";
     }
 
-    // A fixed array T[k], the only array kind on the GPU: its detail, else
-    // null.
+    // A fixed array T[k]: its detail, else null.
     static TypeArray *FixedArray(const TypeExpr *t) {
         return t->kind == TY_ARRAY && t->arr->akind == A_FIXED && t->arr->size >= 0 ? t->arr
                                                                                     : nullptr;
     }
+
+    // A limited array T[..k] (design/gpu_language.md §7): its detail, else
+    // null. On the GPU, a length and k elements.
+    static TypeArray *LimitedArray(const TypeExpr *t) {
+        return t->kind == TY_ARRAY && t->arr->akind == A_LIMITED && t->arr->size >= 0 ? t->arr
+                                                                                      : nullptr;
+    }
+
+    // Either kind, the arrays the GPU has.
+    static TypeArray *GpuArray(const TypeExpr *t) {
+        if (auto a = FixedArray(t)) return a;
+        return LimitedArray(t);
+    }
+
+    // The bytes of a limited array's length in memory, as Goose packs it.
+    static int64_t LenSize(int64_t k) { return k <= 255 ? 1 : k <= 65535 ? 2 : 4; }
 
     string ScalarName(const TypeExpr *t, Line l) {
         if (t->kind == TY_BOOL) return "bool";
@@ -183,6 +198,7 @@ struct GpuEmitter {
         if (t->kind == TY_ENUM) return AdtName(t, l);
         if (t->kind == TY_VARIANT) return VariantName(t, l);
         if (FixedArray(t)) return ArrayName(t, l);
+        if (LimitedArray(t)) return LimitedName(t, l);
         if (t->kind == TY_ARRAY)
             Fail(l, cat("only fixed arrays run on the GPU, T[k], not ", TypeStr(t)));
         if (t->kind == TY_REF)
@@ -220,6 +236,7 @@ struct GpuEmitter {
         if (IsScalar(t)) return 4;
         if (auto w = VecWidth(t)) return PackedSize(VecElem(t), l) * w;
         if (auto a = FixedArray(t)) return PackedSize(a->sub, l) * a->size;
+        if (auto a = LimitedArray(t)) return LenSize(a->size) + PackedSize(a->sub, l) * a->size;
         if (t->kind == TY_ENUM) {
             auto ei = EInst(t, l);
             return TagSize(ei) + 4 * AdtWords(ei, l);
@@ -451,7 +468,7 @@ struct GpuEmitter {
     // Whether a type holds an ADT anywhere, which a buffer holds as Goose
     // packs it, the payload after the tag's bytes.
     bool HasAdt(TypeExpr *t) {
-        if (t->kind == TY_ENUM) return true;
+        if (t->kind == TY_ENUM || LimitedArray(t)) return true;
         if (auto a = FixedArray(t)) return HasAdt(a->sub);
         if (t->kind == TY_STRUCT && !VecWidth(t)) {
             auto si = t->struc->inst;
@@ -511,6 +528,19 @@ struct GpuEmitter {
         if (auto a = FixedArray(t)) {
             auto es = PackedSize(a->sub, l);
             for (int64_t k = 0; k < a->size; k++) ReadFields(a->sub, cat(path, ".v[", k, "]"), at, off + k * es, body, l);
+            return;
+        }
+        if (auto la = LimitedArray(t)) {
+            // Its length, held to its capacity, and its elements.
+            auto ls = LenSize(la->size);
+            auto es = PackedSize(la->sub, l);
+            body += cat("    ", path, ".len = ", word(off), ls == 4 ? "" : ls == 2 ? " & 0xffffu" : " & 0xffu", ";\n");
+            FaultHelper();
+            body += cat("    if (", path, ".len > ", la->size, "u) {\n        gs_fault(", Gs(), Site(l), "u, ",
+                        (int)GS_GPU_FAULT_INDEX, "u, ", path, ".len, ", la->size, "u);\n        ", path, ".len = ",
+                        la->size, "u;\n    }\n");
+            for (int64_t k = 0; k < la->size; k++)
+                ReadFields(la->sub, cat(path, ".v[", k, "]"), at, off + ls + k * es, body, l);
             return;
         }
         if (t->kind == TY_ENUM) {
@@ -655,9 +685,25 @@ struct GpuEmitter {
         return name;
     }
 
+    // A limited array: its length and its elements' fixed array, in the
+    // value's form. Zero at construction (ArrayLitX), so that copying one
+    // copies nothing undefined.
+    string LimitedName(TypeExpr *t, Line l) {
+        auto a = LimitedArray(t);
+        auto et = TypeName(a->sub, l, true);
+        auto key = cat(et, "[..", a->size, "]");
+        if (auto it = arraynames.find(key); it != arraynames.end()) return it->second;
+        if (a->size == 0) Fail(l, "an empty array does not run on the GPU");
+        auto name = cat("gs_limited_", Mangle(a->sub), "_", a->size);
+        globalnames.insert(name);
+        arraynames[key] = name;
+        structdefs += cat("struct ", name, " {\n    uint len;\n    ", et, " v[", a->size, "];\n};\n\n");
+        return name;
+    }
+
     // Element `i` of the array `arr` of type `t`, as a value.
     string ElemRead(const string &arr, const string &i, TypeExpr *t, Line l) {
-        auto et = FixedArray(t)->sub;
+        auto et = GpuArray(t)->sub;
         auto x = cat(arr, ".v[", i, "]");
         return msl() && VecWidth(et) ? cat(TypeName(et, l), "(", x, ")") : x;
     }
@@ -809,13 +855,25 @@ struct GpuEmitter {
         if (auto b = Bound(idx); b >= 0 && b <= n) return X(idx);
         auto i = X(idx);
         FaultHelper();
+        CheckedIndexHelper();
+        return cat("gs_index(", Gs(), "uint(", i, "), ", n, "u, ", Site(l), "u)");
+    }
+
+    // Index `i` of a limited array whose length is `len`, checked always.
+    string CheckedIndexLen(Node *idx, const string &len, Line l) {
+        auto i = IndexX(idx);
+        FaultHelper();
+        CheckedIndexHelper();
+        return cat("gs_index(", Gs(), "uint(", i, "), ", len, ", ", Site(l), "u)");
+    }
+
+    void CheckedIndexHelper() {
         if (helpers.insert("gs_index").second)
             helperdefs += cat("uint gs_index(", msl() ? "thread GsCtx &gs, " : "",
                               "uint i, uint n, uint site) {\n"
                               "    if (i < n) return i;\n"
                               "    gs_fault(", Gs(), "site, ", (int)GS_GPU_FAULT_INDEX, "u, i, n);\n"
                               "    return 0u;\n}\n\n");
-        return cat("gs_index(", Gs(), "uint(", i, "), ", n, "u, ", Site(l), "u)");
     }
 
     // An integer division or remainder: by zero, it faults and gives 0.
@@ -988,8 +1046,17 @@ struct GpuEmitter {
             case NK_Index: {
                 auto ix = (Index *)n;
                 auto at = ArrayType(ix->obj);
-                if (!FixedArray(at)) TypeName(at, n->line);   // Fails, saying why.
+                if (!GpuArray(at)) TypeName(at, n->line);   // Fails, saying why.
                 auto o = X(ix->obj);
+                if (LimitedArray(at)) {
+                    if (!RootOf(ix->obj)) {
+                        auto t = Temp();
+                        L(cat("const ", TypeName(at, n->line), " ", t, " = ", o, ";"));
+                        o = t;
+                    }
+                    return ElemRead(o, ix->nobc ? IndexX(ix->idx) : CheckedIndexLen(ix->idx, cat(o, ".len"), n->line),
+                                    at, n->line);
+                }
                 return ElemRead(o, ix->nobc ? IndexX(ix->idx) : CheckedIndex(ix->idx, FixedArray(at)->size, n->line),
                                 at, n->line);
             }
@@ -1426,6 +1493,10 @@ struct GpuEmitter {
         }
         if (d->member == B_LEN) {
             if (auto a = FixedArray(ArrayType(d->obj))) return LenText(a->size, d->exprtype, d->line);
+            if (LimitedArray(ArrayType(d->obj))) return cat("int(", X(d->obj), ".len)");
+        }
+        if (d->member == B_CAP) {
+            if (auto a = LimitedArray(ArrayType(d->obj))) return LenText(a->size, d->exprtype, d->line);
         }
         if (d->member >= 0) Fail(d, cat(".", d->name, " does not run on the GPU"));
         auto ot = d->obj->exprtype;
@@ -1450,8 +1521,9 @@ struct GpuEmitter {
         if (auto ix = Is<Index>(n)) {
             auto at = ArrayType(ix->obj);
             auto lv = LValue(ix->obj);
-            auto i = ix->nobc || !FixedArray(at) ? IndexX(ix->idx)
-                                                 : CheckedIndex(ix->idx, FixedArray(at)->size, n->line);
+            auto i = ix->nobc ? IndexX(ix->idx)
+                   : LimitedArray(at) ? CheckedIndexLen(ix->idx, cat(lv, ".len"), n->line)
+                   : FixedArray(at) ? CheckedIndex(ix->idx, FixedArray(at)->size, n->line) : IndexX(ix->idx);
             return cat(lv, ".v[", i, "]");
         }
         return X(n);
@@ -1467,6 +1539,26 @@ struct GpuEmitter {
     // `[a, b, c]` or `[v; k]`, built in a local.
     string ArrayLitX(ArrayLit *a) {
         auto t = a->exprtype;
+        if (auto la = LimitedArray(t)) {
+            if (a->capexpr) Fail(a, "internal: a capacity literal of a fixed limited array");
+            auto tv = Temp();
+            L(cat(TypeName(t, a->line), " ", tv, " = ", ZeroOf(t, a->line), ";"));
+            if (a->fillval) {
+                auto v = Convert(X(a->fillval), a->fillval->exprtype, la->sub, a->line);
+                int64_t n = 0;
+                if (!FoldLitInt(a->fillcount, n) || n < 0 || n > la->size)
+                    Fail(a, "a limited array's fill count on the GPU is a constant within its capacity");
+                auto i = Temp();
+                L(cat("for (int ", i, " = 0; ", i, " < ", n, "; ", i, "++) ", tv, ".v[", i, "] = ", v, ";"));
+                L(cat(tv, ".len = ", n, "u;"));
+                return tv;
+            }
+            for (size_t i = 0; i < a->elems.size(); i++)
+                L(cat(tv, ".v[", i, "] = ",
+                      Convert(X(a->elems[i]), a->elems[i]->exprtype, la->sub, a->elems[i]->line), ";"));
+            L(cat(tv, ".len = ", a->elems.size(), "u;"));
+            return tv;
+        }
         auto fa = FixedArray(t);
         if (!fa) TypeName(t, a->line);   // Fails, saying why.
         auto tn = TypeName(t, a->line);
@@ -1598,9 +1690,10 @@ struct GpuEmitter {
                 case B_GPU_STORE: {
                     auto et = an[2]->exprtype;
                     if (HasAdt(et))
-                        Fail(c, "storing an ADT into a buffer does not run on the GPU yet: Goose packs "
-                                "its payload after the tag's byte, and a GPU writes whole words, which "
-                                "neighbouring elements would share (design/gpu_language.md §5)");
+                        Fail(c, "storing an ADT or a limited array into a buffer does not run on the GPU "
+                                "yet: Goose packs what follows its tag or length unaligned, and a GPU "
+                                "writes whole words, which neighbouring elements would share "
+                                "(design/gpu_language.md §5)");
                     auto index = X(an[0]);
                     auto i = X(an[1]);
                     auto v = X(an[2]);
@@ -1627,10 +1720,12 @@ struct GpuEmitter {
                     auto cmp = cas ? X(an[1]) : string();
                     return AtomicX(op, lv, "", "", v, cmp, t, c->line);
                 }
+                case B_PUSH: case B_POP: case B_POP_N: case B_CLEAR: return LimitedOpX(c, an);
                 case B_DEFAULT: return ZeroOf(c->exprtype, c->line);
                 case B_LEN:
                     if (auto a = FixedArray(ArrayType(an[0])))
                         return LenText(a->size, c->exprtype, c->line);
+                    if (LimitedArray(ArrayType(an[0]))) return cat("int(", X(an[0]), ".len)");
                     Fail(c, "len runs on the GPU on fixed arrays only");
                 default:
                     Fail(c, cat(BuiltinByKind(c->builtin).name, " does not run on the GPU"));
@@ -1921,6 +2016,60 @@ struct GpuEmitter {
         }
         L("}");
         return res;
+    }
+
+    // push, pop, pop_n and clear on a limited array: within its capacity and
+    // its length, or a fault and nothing done (pop gives a default value).
+    string LimitedOpX(Call *c, const vector<Node *> &an) {
+        auto at = ArrayType(an[0]);
+        auto la = LimitedArray(at);
+        if (!la) Fail(c, cat(BuiltinByKind(c->builtin).name, " runs on the GPU on limited arrays (T[..k]) "
+                             "only (design/gpu_language.md §7)"));
+        auto lv = LValue(an[0]);
+        FaultHelper();
+        switch (c->builtin) {
+            case B_PUSH: {
+                auto v = Convert(X(an[1]), an[1]->exprtype, la->sub, c->line);
+                L(cat("if (", lv, ".len < ", la->size, "u) {"));
+                L(cat("    ", lv, ".v[", lv, ".len] = ", v, ";"));
+                L(cat("    ", lv, ".len++;"));
+                L("} else {");
+                L(cat("    gs_fault(", Gs(), Site(c->line), "u, ", (int)GS_GPU_FAULT_FULL, "u, ", lv, ".len, ",
+                      la->size, "u);"));
+                L("}");
+                return "";
+            }
+            case B_POP: {
+                auto r = Temp();
+                L(cat(TypeName(la->sub, c->line), " ", r, ";"));
+                L(cat("if (", lv, ".len > 0u) {"));
+                L(cat("    ", lv, ".len--;"));
+                L(cat("    ", r, " = ", ElemRead(lv, cat(lv, ".len"), at, c->line), ";"));
+                L("} else {");
+                L(cat("    gs_fault(", Gs(), Site(c->line), "u, ", (int)GS_GPU_FAULT_EMPTY, "u, 0u, 0u);"));
+                L(cat("    ", r, " = ", ZeroOf(la->sub, c->line), ";"));
+                L("}");
+                return r;
+            }
+            case B_POP_N: {
+                auto n = Temp();
+                // A count Goose takes as an i64, given as a 32-bit value.
+                auto cn = an[1];
+                if (auto c2 = Is<AsCast>(cn); c2 && IsScalar(c2->child->exprtype)) cn = c2->child;
+                L(cat("const uint ", n, " = uint(", X(cn), ");"));
+                L(cat("if (", n, " <= ", lv, ".len) {"));
+                L(cat("    ", lv, ".len -= ", n, ";"));
+                L("} else {");
+                L(cat("    gs_fault(", Gs(), Site(c->line), "u, ", (int)GS_GPU_FAULT_EMPTY, "u, ", n, ", ", lv,
+                      ".len);"));
+                L(cat("    ", lv, ".len = 0u;"));
+                L("}");
+                return "";
+            }
+            default:
+                L(cat(lv, ".len = 0u;"));
+                return "";
+        }
     }
 
     // A wave intrinsic (stdlib/gpu_shader.goose), compute and fragment
@@ -2286,8 +2435,9 @@ struct GpuEmitter {
     // counted loop, the element a copy, or for `&x` the element itself.
     void ForArray(ForLoop *f) {
         auto at = ArrayType(f->iter);
-        auto fa = FixedArray(at);
+        auto fa = GpuArray(at);
         if (!fa) TypeName(at, f->line);   // Fails, saying why.
+        auto limited = LimitedArray(at) != nullptr;
         string arr;
         if (f->byref) {
             arr = LValue(f->iter);
@@ -2297,7 +2447,8 @@ struct GpuEmitter {
         }
         auto ctr = Temp();
         fs->breakdsts.push_back("");
-        L(cat("for (int ", ctr, " = 0; ", ctr, " < ", fa->size, "; ", ctr, "++) {"));
+        L(cat("for (int ", ctr, " = 0; ", ctr, " < ", limited ? cat("int(", arr, ".len)") : cat(fa->size), "; ",
+              ctr, "++) {"));
         fs->ind++;
         if (f->idxdef) {
             auto it = TypeName(f->idxdef->type, f->line);
@@ -2513,8 +2664,8 @@ struct GpuEmitter {
     pair<string, string> BlockDecl(VarDef *v, int k) {
         auto pt = k ? v->type->ref->sub : v->type;
         if (HasAdt(pt))
-            Fail(v->line, cat(k ? "a uniform block" : "push constants", " holding an ADT do not run on the "
-                              "GPU yet: read it from a buffer"));
+            Fail(v->line, cat(k ? "a uniform block" : "push constants", " holding an ADT or a limited array "
+                              "do not run on the GPU yet: read it from a buffer"));
         auto tn = TypeName(pt, v->line, true);
         auto size = PackedSize(pt, v->line);
         auto limit = k ? 65536 : 128;
