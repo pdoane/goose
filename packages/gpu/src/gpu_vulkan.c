@@ -22,6 +22,11 @@
 
 #include "gpu_internal.h"
 
+#ifdef GOOSE_GPU_SDL
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,7 +58,10 @@ static void *loader_sym(void *l, const char *n) { return dlsym(l, n); }
     F(vkDestroyInstance) F(vkEnumeratePhysicalDevices) F(vkGetPhysicalDeviceProperties2) \
     F(vkGetPhysicalDeviceQueueFamilyProperties) F(vkGetPhysicalDeviceMemoryProperties) \
     F(vkGetPhysicalDeviceFeatures2) F(vkCreateDevice) F(vkGetDeviceProcAddr) \
-    F(vkEnumerateDeviceExtensionProperties) F(vkGetPhysicalDeviceFormatProperties)
+    F(vkEnumerateDeviceExtensionProperties) F(vkGetPhysicalDeviceFormatProperties) \
+    F(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) F(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+    F(vkGetPhysicalDeviceSurfacePresentModesKHR) F(vkGetPhysicalDeviceSurfaceSupportKHR) \
+    F(vkDestroySurfaceKHR)
 #define VK_DEVICE(F) \
     F(vkDestroyDevice) F(vkGetDeviceQueue) F(vkCreateBuffer) F(vkDestroyBuffer) \
     F(vkGetBufferMemoryRequirements) F(vkAllocateMemory) F(vkFreeMemory) F(vkBindBufferMemory) \
@@ -71,7 +79,9 @@ static void *loader_sym(void *l, const char *n) { return dlsym(l, n); }
     F(vkDestroyImageView) F(vkCreateSampler) F(vkDestroySampler) F(vkCmdCopyBufferToImage) \
     F(vkCmdCopyImageToBuffer) F(vkCmdCopyBuffer) F(vkCmdBeginRendering) F(vkCmdEndRendering) \
     F(vkCmdSetViewport) F(vkCmdSetScissor) F(vkCmdDraw) F(vkCmdDrawIndexed) \
-    F(vkCmdBindIndexBuffer) F(vkCmdPushDescriptorSetKHR)
+    F(vkCmdBindIndexBuffer) F(vkCmdPushDescriptorSetKHR) F(vkCreateSwapchainKHR) \
+    F(vkDestroySwapchainKHR) F(vkGetSwapchainImagesKHR) F(vkAcquireNextImageKHR) \
+    F(vkQueuePresentKHR)
 
 #define DECLARE(f) static PFN_##f f;
 VK_GLOBAL(DECLARE)
@@ -132,6 +142,26 @@ static vkbuffer ring;
 static uint64_t ringhead, ringcmdstart;
 static uint64_t ringgen = UINT64_MAX;
 static VkDeviceSize ringat;
+
+/* The window's swap chain: its images, a render-done semaphore each, and a
+   ring of acquire semaphores, each free again once the submission that
+   waited on it has completed. */
+#define MAX_SWAP 8
+#define ACQUIRES 4
+static VkSurfaceKHR surface;
+static VkSwapchainKHR swapchain;
+static VkFormat swapformat;
+static VkExtent2D swapextent;
+static uint32_t nswap;
+static VkImage swapimages[MAX_SWAP];
+static VkImageView swapviews[MAX_SWAP];
+static VkSemaphore renderdone[MAX_SWAP];
+static struct { VkSemaphore sem; uint64_t fence; } acquires[ACQUIRES];
+static int acquirenext;
+static int vsyncwanted;
+static void *sdlwindow;
+static int acquired = -1;           /* the image this frame draws into */
+static int acquireslot = -1;        /* its acquire semaphore, until a submission waits */
 
 static int inrender;
 static VkPipelineBindPoint bindpoint;
@@ -205,6 +235,9 @@ static vkaccess access_of(int a) {
         case GOOSE_GPU_ACCESS_COPY_DST:
             return (vkaccess) { VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL };
+        case GOOSE_GPU_ACCESS_PRESENT:
+            return (vkaccess) { VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR };
         default:
             return (vkaccess) { VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
                                 VK_IMAGE_LAYOUT_UNDEFINED };
@@ -215,7 +248,7 @@ static void image_barrier(VkCommandBuffer cb, vkimage *im, vkaccess from, vkacce
     VkImageMemoryBarrier2 b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
     b.srcStageMask = from.stage ? from.stage : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
     b.srcAccessMask = from.access;
-    b.dstStageMask = to.stage;
+    b.dstStageMask = to.stage ? to.stage : VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
     b.dstAccessMask = to.access;
     b.oldLayout = from.layout;
     b.newLayout = to.layout;
@@ -257,6 +290,21 @@ static int load_global(void) {
     VK_GLOBAL(LOAD)
 #undef LOAD
     return 1;
+}
+
+/* The loader's path, for SDL to load the same one: its own search on a Mac
+   looks for MoltenVK. Null where there is none. */
+const char *goose_gpu_vulkan_loader_path(void) {
+    if (!load_global()) return NULL;
+#ifdef _WIN32
+    static char path[1024];
+    if (!GetModuleFileNameA((HMODULE)loader, path, sizeof path)) return NULL;
+    return path;
+#else
+    Dl_info info;
+    if (!dladdr((void *)vkGetInstanceProcAddr, &info) || !info.dli_fname) return NULL;
+    return info.dli_fname;
+#endif
 }
 
 static int has_layer(const char *name) {
@@ -352,13 +400,31 @@ static int make_samplers(void) {
     return 1;
 }
 
-static int vk_open(void) {
+static int make_swapchain(void);
+static void vk_wait(uint64_t fence);
+
+static int vk_open(void *window, int vsync) {
     if (!load_global()) return 0;
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     app.pApplicationName = "goose";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
+    sdlwindow = window;
+    vsyncwanted = vsync;
+    int portability = 0;
+#ifdef GOOSE_GPU_SDL
+    /* The surface extensions SDL needs for the window. */
+    if (window) {
+        Uint32 next = 0;
+        const char *const *wext = SDL_Vulkan_GetInstanceExtensions(&next);
+        ici.enabledExtensionCount = next;
+        ici.ppEnabledExtensionNames = wext;
+        for (Uint32 i = 0; i < next; i++)
+            if (!strcmp(wext[i], VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) portability = 1;
+        if (portability) ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+#endif
     const char *validation = "VK_LAYER_KHRONOS_validation";
     const char *v = getenv("GOOSE_GPU_VALIDATION");
     if (v && *v && strcmp(v, "0") && has_layer(validation)) {
@@ -380,7 +446,20 @@ static int vk_open(void) {
     VkPhysicalDevice devs[16];
     if (n > 16) n = 16;
     vkEnumeratePhysicalDevices(instance, &n, devs);
-    physical = devs[0];
+    physical = VK_NULL_HANDLE;
+    /* A portability driver (MoltenVK) only where nothing else is offered. */
+    for (uint32_t i = 0; i < n && !physical; i++) {
+        VkPhysicalDeviceDriverProperties drv = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+        VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        p2.pNext = &drv;
+        vkGetPhysicalDeviceProperties2(devs[i], &p2);
+        if (drv.driverID != VK_DRIVER_ID_MOLTENVK) physical = devs[i];
+    }
+    if (!physical) {
+        goose_gpu_fail("no Vulkan device but MoltenVK, which the gpu package does not use: on a "
+                       "Mac, install KosmicKrisp (the Vulkan SDK's conformant driver)");
+        return 0;
+    }
     VkPhysicalDeviceProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
     vkGetPhysicalDeviceProperties2(physical, &props);
     const char *dn = props.properties.deviceName;
@@ -468,12 +547,12 @@ static int vk_open(void) {
     w2.features.shaderStorageImageReadWithoutFormat = f2.features.shaderStorageImageReadWithoutFormat;
     w2.features.shaderStorageImageWriteWithoutFormat = f2.features.shaderStorageImageWriteWithoutFormat;
     const char *exts[] = { VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME,
-                           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
+                           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     dci.pNext = &w2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 2;
+    dci.enabledExtensionCount = window ? 3 : 2;
     dci.ppEnabledExtensionNames = exts;
     if (!check(vkCreateDevice(physical, &dci, NULL, &device), "vkCreateDevice")) return 0;
 #define LOAD(f) f = (PFN_##f)vkGetDeviceProcAddr(device, #f);
@@ -562,7 +641,160 @@ static int vk_open(void) {
     submitted = 0;
     ringhead = ringcmdstart = 0;
     ringgen = UINT64_MAX;
-    return make_samplers();
+    if (!make_samplers()) return 0;
+    if (!window) return 1;
+#ifdef GOOSE_GPU_SDL
+    if (!SDL_Vulkan_CreateSurface((SDL_Window *)window, instance, NULL, &surface)) {
+        goose_gpu_fail("SDL made no Vulkan surface: %s", SDL_GetError());
+        return 0;
+    }
+    VkBool32 ok = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(physical, queuefamily, surface, &ok);
+    if (!ok) {
+        goose_gpu_fail("the Vulkan queue cannot present to the window");
+        return 0;
+    }
+    for (int i = 0; i < ACQUIRES; i++) {
+        VkSemaphoreCreateInfo bsi = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        if (!check(vkCreateSemaphore(device, &bsi, NULL, &acquires[i].sem), "vkCreateSemaphore"))
+            return 0;
+        acquires[i].fence = 0;
+    }
+    return make_swapchain();
+#else
+    goose_gpu_fail("no SDL: no window");
+    return 0;
+#endif
+}
+
+static void drop_swapchain(void) {
+    for (uint32_t i = 0; i < nswap; i++) {
+        vkDestroyImageView(device, swapviews[i], NULL);
+        vkDestroySemaphore(device, renderdone[i], NULL);
+    }
+    nswap = 0;
+    if (swapchain) vkDestroySwapchainKHR(device, swapchain, NULL);
+    swapchain = VK_NULL_HANDLE;
+}
+
+/* The swap chain, made again when the window's size changes. */
+static int make_swapchain(void) {
+    vkDeviceWaitIdle(device);
+    VkSurfaceCapabilitiesKHR caps;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps);
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == UINT32_MAX) {
+        int w = 0, h = 0;
+#ifdef GOOSE_GPU_SDL
+        SDL_GetWindowSizeInPixels((SDL_Window *)sdlwindow, &w, &h);
+#endif
+        extent = (VkExtent2D) { (uint32_t)w, (uint32_t)h };
+    }
+    if (!extent.width || !extent.height) return 1;     /* minimized: none for now */
+    uint32_t nf = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &nf, NULL);
+    VkSurfaceFormatKHR formats[64];
+    if (nf > 64) nf = 64;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &nf, formats);
+    swapformat = VK_FORMAT_UNDEFINED;
+    VkColorSpaceKHR space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    for (uint32_t i = 0; i < nf; i++)
+        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM) {
+            swapformat = formats[i].format;
+            space = formats[i].colorSpace;
+        }
+    if (swapformat == VK_FORMAT_UNDEFINED) {
+        goose_gpu_fail("the window takes no BGRA8 swap chain");
+        return 0;
+    }
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    if (!vsyncwanted) {
+        uint32_t nm = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &nm, NULL);
+        VkPresentModeKHR modes[16];
+        if (nm > 16) nm = 16;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &nm, modes);
+        for (uint32_t i = 0; i < nm; i++)
+            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR || modes[i] == VK_PRESENT_MODE_MAILBOX_KHR)
+                mode = modes[i];
+    }
+    uint32_t count = caps.minImageCount + 1;
+    if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
+    if (count > MAX_SWAP) count = MAX_SWAP;
+    VkSwapchainKHR old = swapchain;
+    VkSwapchainCreateInfoKHR sci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+    sci.surface = surface;
+    sci.minImageCount = count;
+    sci.imageFormat = swapformat;
+    sci.imageColorSpace = space;
+    sci.imageExtent = extent;
+    sci.imageArrayLayers = 1;
+    sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sci.preTransform = caps.currentTransform;
+    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    sci.presentMode = mode;
+    sci.clipped = VK_TRUE;
+    sci.oldSwapchain = old;
+    VkSwapchainKHR made;
+    if (!check(vkCreateSwapchainKHR(device, &sci, NULL, &made), "vkCreateSwapchainKHR")) return 0;
+    swapchain = old;
+    drop_swapchain();
+    swapchain = made;
+    swapextent = extent;
+    nswap = MAX_SWAP;
+    vkGetSwapchainImagesKHR(device, swapchain, &nswap, swapimages);
+    for (uint32_t i = 0; i < nswap; i++) {
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = swapimages[i];
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = swapformat;
+        vci.subresourceRange = (VkImageSubresourceRange) { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        if (!check(vkCreateImageView(device, &vci, NULL, &swapviews[i]), "vkCreateImageView"))
+            return 0;
+        VkSemaphoreCreateInfo bsi = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        if (!check(vkCreateSemaphore(device, &bsi, NULL, &renderdone[i]), "vkCreateSemaphore"))
+            return 0;
+    }
+    return 1;
+}
+
+static int vk_acquire(uint32_t slot, int *width, int *height) {
+    if (!surface) return 0;
+    VkSurfaceCapabilitiesKHR caps;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps);
+    if (!swapchain || (caps.currentExtent.width != UINT32_MAX &&
+                       (caps.currentExtent.width != swapextent.width ||
+                        caps.currentExtent.height != swapextent.height)))
+        if (!make_swapchain() || !swapchain) return 0;
+    for (int tries = 0; tries < 2; tries++) {
+        int a = acquirenext;
+        vk_wait(acquires[a].fence);
+        uint32_t index = 0;
+        VkResult r = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquires[a].sem,
+                                           VK_NULL_HANDLE, &index);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+            if (!make_swapchain() || !swapchain) return 0;
+            continue;
+        }
+        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+            check(r, "vkAcquireNextImageKHR");
+            return 0;
+        }
+        acquirenext = (acquirenext + 1) % ACQUIRES;
+        acquireslot = a;
+        acquired = (int)index;
+        vkimage *im = &images[slot];
+        im->image = swapimages[index];
+        im->view = swapviews[index];
+        im->memory = VK_NULL_HANDLE;
+        im->format = swapformat;
+        im->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        *width = (int)swapextent.width;
+        *height = (int)swapextent.height;
+        return 1;
+    }
+    return 0;
 }
 
 static uint64_t vk_completed(void) {
@@ -600,6 +832,13 @@ static void retire(VkCommandBuffer cb, vkbuffer *staging, uint64_t fence) {
 static void vk_close(void) {
     if (!device) return;
     vkDeviceWaitIdle(device);
+    if (surface) {
+        drop_swapchain();
+        for (int i = 0; i < ACQUIRES; i++) vkDestroySemaphore(device, acquires[i].sem, NULL);
+        vkDestroySurfaceKHR(instance, surface, NULL);
+        surface = VK_NULL_HANDLE;
+    }
+    acquired = acquireslot = -1;
     reclaim();
     if (cmd) vkFreeCommandBuffers(device, cmdpool, 1, &cmd);
     if (uploads) vkFreeCommandBuffers(device, cmdpool, 1, &uploads);
@@ -742,6 +981,10 @@ static void vk_release(uint32_t slot, int texture) {
     vkDeviceWaitIdle(device);
     if (texture) {
         vkimage *im = &images[slot];
+        if (!im->memory) {          /* a swap chain image, the swap chain's to destroy */
+            memset(im, 0, sizeof *im);
+            return;
+        }
         vkDestroyImageView(device, im->view, NULL);
         vkDestroyImage(device, im->image, NULL);
         vkFreeMemory(device, im->memory, NULL);
@@ -1091,7 +1334,7 @@ static void vk_readback_release(void *rb) {
     free(rb);
 }
 
-static uint64_t vk_submit(void) {
+static uint64_t vk_submit(int present) {
     if (!begin()) return submitted;
     /* What the GPU wrote is the host's to read once the fence passes. */
     memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -1105,20 +1348,50 @@ static uint64_t vk_submit(void) {
     }
     list[n++] = cmd;
     uint64_t fence = submitted + 1;
+    /* The screen's image: waited for by the first submission after it was
+       acquired, and shown after the one that presents it. */
+    VkSemaphore waits[1], signals[2] = { timeline, VK_NULL_HANDLE };
+    VkPipelineStageFlags waitstages[1] = { VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
+    uint64_t waitvalues[1] = { 0 }, signalvalues[2] = { fence, 0 };
+    uint32_t nwait = 0, nsignal = 1;
+    if (acquireslot >= 0) {
+        waits[nwait++] = acquires[acquireslot].sem;
+        acquires[acquireslot].fence = fence;
+        acquireslot = -1;
+    }
+    int presenting = present && acquired >= 0;
+    if (presenting) signals[nsignal++] = renderdone[acquired];
     VkTimelineSemaphoreSubmitInfo tsi = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-    tsi.signalSemaphoreValueCount = 1;
-    tsi.pSignalSemaphoreValues = &fence;
+    tsi.waitSemaphoreValueCount = nwait;
+    tsi.pWaitSemaphoreValues = waitvalues;
+    tsi.signalSemaphoreValueCount = nsignal;
+    tsi.pSignalSemaphoreValues = signalvalues;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.pNext = &tsi;
+    si.waitSemaphoreCount = nwait;
+    si.pWaitSemaphores = waits;
+    si.pWaitDstStageMask = waitstages;
     si.commandBufferCount = n;
     si.pCommandBuffers = list;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &timeline;
+    si.signalSemaphoreCount = nsignal;
+    si.pSignalSemaphores = signals;
     if (!check(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit")) {
         goose_gpu_misuse("%s", "the submission failed");
         return submitted;
     }
     submitted = fence;
+    if (presenting) {
+        uint32_t index = (uint32_t)acquired;
+        VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &renderdone[index];
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &swapchain;
+        pi.pImageIndices = &index;
+        VkResult r = vkQueuePresentKHR(queue, &pi);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) swapextent = (VkExtent2D) { 0, 0 };
+        acquired = -1;
+    }
     retire(cmd, NULL, fence);
     if (uploads) retire(uploads, NULL, fence);
     for (int i = 0; i < npending; i++) retire(VK_NULL_HANDLE, &pendingstaging[i], fence);
@@ -1146,5 +1419,5 @@ const goose_gpu_backend goose_gpu_vulkan = {
     vk_dispatch, vk_draw, vk_index_buffer, vk_viewport, vk_scissor,
     vk_barrier,
     vk_readback_buffer, vk_readback_texture, vk_readback_read, vk_readback_release,
-    vk_submit, vk_completed, vk_wait,
+    vk_acquire, vk_submit, vk_completed, vk_wait,
 };

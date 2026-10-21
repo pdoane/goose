@@ -24,9 +24,20 @@ if(NOT GOOSE_GPU_VULKAN_INCLUDE)
 endif()
 target_include_directories(goose_gpu PRIVATE ${GOOSE_GPU_VULKAN_INCLUDE})
 
+# Windows come from SDL3 where it is installed; without it the package
+# still builds, with devices that have no window.
+find_package(SDL3 CONFIG QUIET)
+if(SDL3_FOUND)
+    target_compile_definitions(goose_gpu PRIVATE GOOSE_GPU_SDL=1)
+    target_link_libraries(goose_gpu PUBLIC SDL3::SDL3)
+else()
+    message(STATUS "gpu: no SDL3, so no windows")
+endif()
+
 if(APPLE)
     set_source_files_properties(src/gpu_metal.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-    target_link_libraries(goose_gpu PUBLIC "-framework Metal" "-framework Foundation")
+    target_link_libraries(goose_gpu PUBLIC "-framework Metal" "-framework QuartzCore"
+                          "-framework Foundation")
 elseif(UNIX)
     target_link_libraries(goose_gpu PUBLIC ${CMAKE_DL_LIBS})
 endif()

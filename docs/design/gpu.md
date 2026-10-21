@@ -822,8 +822,15 @@ Each phase lands as working commits with its tests.
    pipelines made per target formats, indexed draws, barriers checked
    against each texture's tracked access, and read backs copied where they
    are asked for. `packages/gpu/test/raster.goose` renders a textured quad
-   exactly on both backends, under validation. Next: windows and
-   presentation, updates to resources in use, and the cube.
+   exactly on both backends, under validation. Windows and presentation
+   are built too, through SDL3 where it is installed: a `CAMetalLayer` with
+   Metal 4's drawable protocol, a Vulkan swap chain made again when the
+   window's size changes, `begin_screen` placing its own barriers, input
+   and frame timing as gfx's, and `GOOSE_GPU_HEADLESS=1` for tests.
+   `packages/gpu/examples/cube.goose`, gfx's cube with Goose shaders, runs
+   in a window on Metal 4 and on KosmicKrisp. Left of phase 2: updates to
+   resources in use (`update_buffer`, `update_texture`), mipmaps, and
+   screenshots to PNG.
 3. **Direct3D 12.** By this point the HLSL emitter and the ABI have been
    exercised through Vulkan, so this is mostly the backend.
 4. **Ray tracing**, on Metal and Direct3D 12: acceleration structures, the

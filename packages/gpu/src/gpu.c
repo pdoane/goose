@@ -4,6 +4,10 @@
 #include "gpu_internal.h"
 #include "goose.h"
 
+#ifdef GOOSE_GPU_SDL
+#include <SDL3/SDL.h>
+#endif
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +38,21 @@ static uint8_t *uniforms;
 static uint32_t uniformlen;
 static uint64_t uniformgen;
 static int indexsize;
+
+/* The window and its screen (§3): the slot the backend puts each frame's
+   image in, or with no window a render target of the size asked for; and
+   a depth target the screen's size. */
+static void *window;
+static uint32_t screenslot, depthslot;
+static int screenacquired;
+static int screenw, screenh;
+static int quitting;
+static uint64_t framecount;
+static double now, lastframe, delta;
+#define MAX_KEYS 512
+static uint8_t keys[MAX_KEYS], lastkeys[MAX_KEYS];
+static float mousex, mousey;
+static uint32_t mousebuttons;
 
 /* Read backs, by id from 1: each a copy recorded where it was asked for,
    ready once the submission carrying it completes. */
@@ -105,12 +124,15 @@ static int outside_pass(const char *what) {
     return 0;
 }
 
-uint8_t goose_gpu_open(int64_t flags) {
-    (void)flags;
-    if (backend) {
-        goose_gpu_fail("the device is already open");
-        return 0;
-    }
+static double clock_seconds(void) {
+#ifdef GOOSE_GPU_SDL
+    return (double)SDL_GetTicksNS() / 1e9;
+#else
+    return 0;
+#endif
+}
+
+static const goose_gpu_backend *pick_backend(void) {
     const char *want = getenv("GOOSE_GPU_BACKEND");
 #ifdef __APPLE__
     const goose_gpu_backend *pick = &goose_gpu_metal;
@@ -124,12 +146,131 @@ uint8_t goose_gpu_open(int64_t flags) {
 #endif
         else {
             goose_gpu_fail("GOOSE_GPU_BACKEND names no backend this build has: %s", want);
-            return 0;
+            return NULL;
         }
     }
-    if (!pick->open()) return 0;
+    return pick;
+}
+
+uint32_t goose_gpu_texture(goose_gpu_texture_desc d, goose_gpu_bytes data);
+void goose_gpu_release(uint32_t slot);
+
+/* The screen's depth target, made again whenever the screen's size
+   changes. */
+static void make_depth(void) {
+    if (depthslot) goose_gpu_release(depthslot);
+    goose_gpu_texture_desc d = { 0, GOOSE_GPU_DEPTH, GOOSE_GPU_DEPTH_TARGET, screenw, screenh, 1, 1, 1 };
+    goose_gpu_bytes none = { NULL, 0 };
+    depthslot = goose_gpu_texture(d, none);
+}
+
+static void reset_frame_state(void) {
+    framecount = 0;
+    now = lastframe = clock_seconds();
+    delta = 0;
+    quitting = 0;
+    memset(keys, 0, sizeof keys);
+    memset(lastkeys, 0, sizeof lastkeys);
+}
+
+uint8_t goose_gpu_open(int64_t flags) {
+    (void)flags;
+    if (backend) {
+        goose_gpu_fail("the device is already open");
+        return 0;
+    }
+    const goose_gpu_backend *pick = pick_backend();
+    if (!pick || !pick->open(NULL, 1)) return 0;
     backend = pick;
+    reset_frame_state();
     return 1;
+}
+
+/* gfx's window flags. */
+enum { WINDOW_RESIZABLE = 1, WINDOW_HIDDEN = 2, WINDOW_FULLSCREEN = 4, NO_VSYNC = 16 };
+
+uint8_t goose_gpu_open_window(goose_gpu_bytes title, int64_t width, int64_t height,
+                              int64_t flags) {
+    if (backend) {
+        goose_gpu_fail("the device is already open");
+        return 0;
+    }
+    if (width <= 0 || height <= 0) {
+        goose_gpu_fail("a window of %lldx%lld", (long long)width, (long long)height);
+        return 0;
+    }
+    const goose_gpu_backend *pick = pick_backend();
+    if (!pick) return 0;
+    const char *headless = getenv("GOOSE_GPU_HEADLESS");
+    if (headless && *headless && strcmp(headless, "0")) {
+        /* No window: the screen is a render target of the size asked for. */
+        if (!pick->open(NULL, 1)) return 0;
+        backend = pick;
+        screenw = (int)width;
+        screenh = (int)height;
+        goose_gpu_texture_desc d = { 0, GOOSE_GPU_BGRA8, GOOSE_GPU_COLOR_TARGET | GOOSE_GPU_SAMPLED,
+                                     screenw, screenh, 1, 1, 1 };
+        goose_gpu_bytes none = { NULL, 0 };
+        screenslot = goose_gpu_texture(d, none);
+        make_depth();
+        reset_frame_state();
+        return screenslot && depthslot;
+    }
+#ifdef GOOSE_GPU_SDL
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+        goose_gpu_fail("SDL: %s", SDL_GetError());
+        return 0;
+    }
+    char name[256];
+    int64_t n = title.len < 255 ? title.len : 255;
+    memcpy(name, title.data, (size_t)n);
+    name[n] = 0;
+    SDL_WindowFlags wf = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (flags & WINDOW_RESIZABLE) wf |= SDL_WINDOW_RESIZABLE;
+    if (flags & WINDOW_HIDDEN) wf |= SDL_WINDOW_HIDDEN;
+    if (flags & WINDOW_FULLSCREEN) wf |= SDL_WINDOW_FULLSCREEN;
+#ifdef __APPLE__
+    wf |= pick == &goose_gpu_metal ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN;
+#else
+    wf |= SDL_WINDOW_VULKAN;
+#endif
+    if (wf & SDL_WINDOW_VULKAN) {
+        /* SDL loads the Vulkan loader the backend does. */
+        extern const char *goose_gpu_vulkan_loader_path(void);
+        const char *loaderpath = goose_gpu_vulkan_loader_path();
+        if (loaderpath) SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, loaderpath);
+    }
+    SDL_Window *w = SDL_CreateWindow(name, (int)width, (int)height, wf);
+    if (!w) {
+        goose_gpu_fail("SDL: %s", SDL_GetError());
+        SDL_Quit();
+        return 0;
+    }
+    if (!pick->open(w, !(flags & NO_VSYNC))) {
+        SDL_DestroyWindow(w);
+        SDL_Quit();
+        return 0;
+    }
+    window = w;
+    backend = pick;
+    SDL_GetWindowSizeInPixels(w, &screenw, &screenh);
+    /* The screen's slot, which holds each frame's image once acquired. */
+    for (uint32_t s = 1; s < GOOSE_GPU_HEAP_SLOTS && !screenslot; s++)
+        if (!slotkind[s]) screenslot = s;
+    slotkind[screenslot] = SLOT_TEXTURE;
+    textures[screenslot].desc = (goose_gpu_texture_desc) { 0, GOOSE_GPU_BGRA8,
+                                                           GOOSE_GPU_COLOR_TARGET, screenw,
+                                                           screenh, 1, 1, 1 };
+    textures[screenslot].access = GOOSE_GPU_ACCESS_NONE;
+    make_depth();
+    reset_frame_state();
+    return depthslot != 0;
+#else
+    (void)title; (void)flags;
+    goose_gpu_fail("this build of the gpu package has no SDL3, so no windows: install SDL3, "
+                   "or set GOOSE_GPU_HEADLESS=1");
+    return 0;
+#endif
 }
 
 static void release_pipeline(goose_gpu_pipe *p) {
@@ -140,7 +281,9 @@ static void release_pipeline(goose_gpu_pipe *p) {
 
 void goose_gpu_close(void) {
     if (!backend) return;
-    backend->wait(backend->submit());
+    backend->wait(backend->submit(0));
+    screenslot = depthslot = 0;
+    screenacquired = 0;
     for (int i = 0; i < MAX_READBACKS; i++)
         if (readbacks[i].used) {
             backend->readback_release(readbacks[i].native);
@@ -156,6 +299,13 @@ void goose_gpu_close(void) {
     backend->close();
     backend = NULL;
     pass = PASS_NONE;
+#ifdef GOOSE_GPU_SDL
+    if (window) {
+        SDL_DestroyWindow((SDL_Window *)window);
+        window = NULL;
+        SDL_Quit();
+    }
+#endif
     free(uniforms);
     uniforms = NULL;
     uniformlen = 0;
@@ -563,10 +713,169 @@ void goose_gpu_barrier(uint32_t slot, int64_t before, int64_t after) {
 uint64_t goose_gpu_submit(void) {
     if (!ready("gpu::submit")) return 0;
     if (!outside_pass("gpu::submit")) return 0;
-    uint64_t f = backend->submit();
+    uint64_t f = backend->submit(0);
     for (int i = 0; i < MAX_READBACKS; i++)
         if (readbacks[i].used && !readbacks[i].fence) readbacks[i].fence = f;
     return f;
+}
+
+/* The screen, its frame's image acquired the first time it is asked for. */
+uint32_t goose_gpu_screen(void) {
+    if (!ready("gpu::screen")) return 0;
+    if (!screenslot) {
+        goose_gpu_misuse("gpu::screen with no window: gpu::open makes one");
+        return 0;
+    }
+    if (window && !screenacquired) {
+        int w = 0, h = 0;
+        if (!backend->acquire(screenslot, &w, &h)) return 0;
+        screenacquired = 1;
+        textures[screenslot].access = GOOSE_GPU_ACCESS_NONE;
+        if (w != screenw || h != screenh) {
+            screenw = w;
+            screenh = h;
+            textures[screenslot].desc.width = w;
+            textures[screenslot].desc.height = h;
+            make_depth();
+        }
+    }
+    return screenslot;
+}
+
+uint32_t goose_gpu_screen_depth(void) { return depthslot; }
+
+/* Goose slices of numbers, as an extern fn passes them (spec §7.10). */
+typedef struct { int32_t *data; int64_t len; } i32_slice;
+typedef struct { float *data; int64_t len; } f32_slice;
+
+void goose_gpu_screen_size(i32_slice out) {
+    if (out.len < 2) return;
+    out.data[0] = screenw;
+    out.data[1] = screenh;
+}
+
+/* A pass over the screen and its depth, cleared, with the barriers that
+   put them there placed for the program, as gfx's begin_screen has none to
+   place. */
+uint8_t goose_gpu_begin_screen(float r, float g, float b, float a) {
+    uint32_t s = goose_gpu_screen();
+    if (!s || !outside_pass("gpu::begin_screen")) return 0;
+    if (textures[s].access != GOOSE_GPU_ACCESS_RENDER_TARGET) {
+        backend->barrier(s, textures[s].access, GOOSE_GPU_ACCESS_RENDER_TARGET);
+        textures[s].access = GOOSE_GPU_ACCESS_RENDER_TARGET;
+    }
+    goose_gpu_tex *d = &textures[depthslot];
+    if (d->access != GOOSE_GPU_ACCESS_DEPTH_WRITE) {
+        backend->barrier(depthslot, d->access, GOOSE_GPU_ACCESS_DEPTH_WRITE);
+        d->access = GOOSE_GPU_ACCESS_DEPTH_WRITE;
+    }
+    goose_gpu_pass_desc pd;
+    memset(&pd, 0, sizeof pd);
+    pd.color[0] = s;
+    pd.depth = depthslot;
+    pd.clear_color = pd.clear_depth = 1;
+    pd.color_value[0] = r;
+    pd.color_value[1] = g;
+    pd.color_value[2] = b;
+    pd.color_value[3] = a;
+    pd.depth_value = 1.0f;
+    return goose_gpu_begin_pass(pd);
+}
+
+void goose_gpu_quit(void) { quitting = 1; }
+
+static void poll_events(void) {
+#ifdef GOOSE_GPU_SDL
+    if (!window) return;
+    SDL_Event e;
+    while (SDL_PollEvent(&e))
+        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quitting = 1;
+    memcpy(lastkeys, keys, sizeof keys);
+    int n = 0;
+    const bool *state = SDL_GetKeyboardState(&n);
+    for (int i = 0; i < MAX_KEYS; i++) keys[i] = i < n && state[i];
+    mousebuttons = SDL_GetMouseState(&mousex, &mousey);
+    float scale = SDL_GetWindowPixelDensity((SDL_Window *)window);
+    mousex *= scale;
+    mousey *= scale;
+#endif
+}
+
+void goose_gpu_poll(void) { poll_events(); }
+
+/* Ends the frame (§3): shows the screen if it was drawn into, submits, and
+   keeps at most two frames in flight; false once asked to close. */
+uint8_t goose_gpu_frame(void) {
+    if (!ready("gpu::frame") || !outside_pass("gpu::frame")) return 0;
+    int present = window && screenacquired;
+    if (present && textures[screenslot].access != GOOSE_GPU_ACCESS_PRESENT) {
+        backend->barrier(screenslot, textures[screenslot].access, GOOSE_GPU_ACCESS_PRESENT);
+        textures[screenslot].access = GOOSE_GPU_ACCESS_PRESENT;
+    }
+    uint64_t f = backend->submit(present);
+    for (int i = 0; i < MAX_READBACKS; i++)
+        if (readbacks[i].used && !readbacks[i].fence) readbacks[i].fence = f;
+    screenacquired = 0;
+    if (f > 2) backend->wait(f - 2);
+    poll_events();
+    framecount++;
+    double t = clock_seconds();
+    delta = t - lastframe;
+    lastframe = t;
+    now = t;
+    goose_gpu_check();
+    return !quitting;
+}
+
+double goose_gpu_time(void) { return now; }
+double goose_gpu_delta_time(void) { return delta; }
+int64_t goose_gpu_frame_count(void) { return (int64_t)framecount; }
+
+static int scancode(goose_gpu_bytes name) {
+#ifdef GOOSE_GPU_SDL
+    char buf[64];
+    int64_t n = name.len < 63 ? name.len : 63;
+    memcpy(buf, name.data, (size_t)n);
+    buf[n] = 0;
+    int sc = (int)SDL_GetScancodeFromName(buf);
+    return sc > 0 && sc < MAX_KEYS ? sc : -1;
+#else
+    (void)name;
+    return -1;
+#endif
+}
+
+uint8_t goose_gpu_key_down(goose_gpu_bytes name) {
+    int sc = scancode(name);
+    return sc >= 0 && keys[sc];
+}
+
+uint8_t goose_gpu_key_pressed(goose_gpu_bytes name) {
+    int sc = scancode(name);
+    return sc >= 0 && keys[sc] && !lastkeys[sc];
+}
+
+void goose_gpu_mouse_position(f32_slice out) {
+    if (out.len < 2) return;
+    out.data[0] = mousex;
+    out.data[1] = mousey;
+}
+
+uint8_t goose_gpu_mouse_down(int64_t button) {
+    return button >= 1 && button <= 5 && (mousebuttons & (1u << (button - 1)));
+}
+
+void goose_gpu_set_title(goose_gpu_bytes title) {
+#ifdef GOOSE_GPU_SDL
+    if (!window) return;
+    char name[256];
+    int64_t n = title.len < 255 ? title.len : 255;
+    memcpy(name, title.data, (size_t)n);
+    name[n] = 0;
+    SDL_SetWindowTitle((SDL_Window *)window, name);
+#else
+    (void)title;
+#endif
 }
 
 uint8_t goose_gpu_fence_done(uint64_t f) { return backend && backend->completed() >= f; }

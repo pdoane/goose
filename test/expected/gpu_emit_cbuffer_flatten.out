@@ -34,7 +34,7 @@ static float4 gs_frag_coord;
 static bool gs_front_facing;
 
 void gpu_store(gpu_RWStructuredBuffer_vec4_f32 b, uint i, float4 v) {
-#line 31 "gpu_shader.goose"
+#line 32 "gpu_shader.goose"
     RWByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
     t0.Store<float4>((i) * 16u, v);
 }
@@ -86,7 +86,7 @@ struct GsCtx {
 };
 
 void gpu_store(thread GsCtx &gs, gpu_RWStructuredBuffer_vec4_f32 b, uint i, float4 v) {
-#line 31 "gpu_shader.goose"
+#line 32 "gpu_shader.goose"
     reinterpret_cast<device packed_float4 *>(gs.heap[b.index])[i] = v;
 }
 
@@ -134,7 +134,7 @@ static float4 gs_frag_coord;
 static bool gs_front_facing;
 
 void gpu_store(gpu_RWStructuredBuffer_vec4_f32 b, uint i, float4 v) {
-#line 31 "gpu_shader.goose"
+#line 32 "gpu_shader.goose"
     RWByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
     t0.Store<float4>((i) * 16u, v);
 }

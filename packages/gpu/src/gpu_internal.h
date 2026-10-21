@@ -50,6 +50,7 @@ enum {
     GOOSE_GPU_ACCESS_DEPTH_READ = 16,
     GOOSE_GPU_ACCESS_COPY_SRC = 32,
     GOOSE_GPU_ACCESS_COPY_DST = 64,
+    GOOSE_GPU_ACCESS_PRESENT = 128,     /* the screen's, when frame() shows it */
 };
 
 #pragma pack(push, 1)
@@ -112,8 +113,9 @@ typedef struct {
 
 typedef struct goose_gpu_backend {
     const char *name;
-    /* 0 on failure, with goose_gpu_fail called. */
-    int (*open)(void);
+    /* 0 on failure, with goose_gpu_fail called. `window` is the SDL window
+       the screen is shown in, null for none. */
+    int (*open)(void *window, int vsync);
     void (*close)(void);
     /* A buffer of `size` bytes in heap slot `slot`, holding `data` when that
        is not null, and visible to shaders at that index. */
@@ -153,9 +155,14 @@ typedef struct goose_gpu_backend {
     void *(*readback_texture)(uint32_t slot, int access, int64_t size);
     void (*readback_read)(void *rb, void *out, int64_t size);
     void (*readback_release)(void *rb);
+    /* The screen's next image, in `slot` from here until it is presented,
+       in access GOOSE_GPU_ACCESS_NONE; its size in pixels. 0 when there is
+       none to draw into (a minimized window). */
+    int (*acquire)(uint32_t slot, int *width, int *height);
     /* Submits what was recorded, after the uploads made since the last
-       submission, and returns its fence, from 1 up. */
-    uint64_t (*submit)(void);
+       submission, and returns its fence, from 1 up; with `present`, shows
+       the screen's image, left in GOOSE_GPU_ACCESS_PRESENT. */
+    uint64_t (*submit)(int present);
     /* The latest fence that has completed. */
     uint64_t (*completed)(void);
     void (*wait)(uint64_t fence);

@@ -42,7 +42,7 @@ int gs_emod_int(int a, int b) {
 }
 
 float gpu_load(gpu_StructuredBuffer_f32 b, uint i) {
-#line 29 "gpu_shader.goose"
+#line 30 "gpu_shader.goose"
     ByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
     return t0.Load<float>((i) * 4u);
 }
@@ -53,7 +53,7 @@ float scaled(float x, float s) {
 }
 
 void gpu_store(gpu_RWStructuredBuffer_f32 b, uint i, float v) {
-#line 31 "gpu_shader.goose"
+#line 32 "gpu_shader.goose"
     RWByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
     t0.Store<float>((i) * 4u, v);
 }
@@ -121,7 +121,7 @@ int gs_emod_int(int a, int b) {
 }
 
 float gpu_load(thread GsCtx &gs, gpu_StructuredBuffer_f32 b, uint i) {
-#line 29 "gpu_shader.goose"
+#line 30 "gpu_shader.goose"
     return reinterpret_cast<device float *>(gs.heap[b.index])[i];
 }
 
@@ -131,7 +131,7 @@ float scaled(thread GsCtx &gs, float x, float s) {
 }
 
 void gpu_store(thread GsCtx &gs, gpu_RWStructuredBuffer_f32 b, uint i, float v) {
-#line 31 "gpu_shader.goose"
+#line 32 "gpu_shader.goose"
     reinterpret_cast<device float *>(gs.heap[b.index])[i] = v;
 }
 
@@ -195,7 +195,7 @@ int gs_emod_int(int a, int b) {
 }
 
 float gpu_load(gpu_StructuredBuffer_f32 b, uint i) {
-#line 29 "gpu_shader.goose"
+#line 30 "gpu_shader.goose"
     ByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
     return t0.Load<float>((i) * 4u);
 }
@@ -206,7 +206,7 @@ float scaled(float x, float s) {
 }
 
 void gpu_store(gpu_RWStructuredBuffer_f32 b, uint i, float v) {
-#line 31 "gpu_shader.goose"
+#line 32 "gpu_shader.goose"
     RWByteAddressBuffer t0 = ResourceDescriptorHeap[b.index];
     t0.Store<float>((i) * 4u, v);
 }

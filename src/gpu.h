@@ -300,6 +300,35 @@ struct GpuEmitter {
         return s + "f";
     }
 
+    // A float made of literals alone that nothing gave a type is an f64
+    // (spec §6.3), converted where it meets an f32. The GPU has no f64, so
+    // it takes the value the CPU would convert: folded at f64 here, and
+    // emitted as one f32 literal.
+    TypeExpr *LitFloatType(Node *n) {
+        auto t = n->exprtype;
+        return t && t->kind == TY_FLT && t->fltstorage == FS_F64 ? ast.flttypes[FS_F32] : t;
+    }
+
+    bool FoldLitFloat(Node *n, double &out) {
+        if (auto f = Is<FltLit>(n)) { out = f->val; return true; }
+        if (auto i = Is<IntLit>(n)) { out = (double)i->val; return true; }
+        if (auto u = Is<Unary>(n)) {
+            if (u->op != T_MINUS || !FoldLitFloat(u->child, out)) return false;
+            out = -out;
+            return true;
+        }
+        auto b = Is<Binary>(n);
+        double l, r;
+        if (!b || !FoldLitFloat(b->left, l) || !FoldLitFloat(b->right, r)) return false;
+        switch (b->op) {
+            case T_PLUS: out = l + r; return true;
+            case T_MINUS: out = l - r; return true;
+            case T_MUL: out = l * r; return true;
+            case T_DIV: out = l / r; return true;
+            default: return false;
+        }
+    }
+
     // ------------------------------------------------------------------
     // Expressions. X emits the statements an expression needs before it
     // and returns its value as text; Into routes a value to a destination.
@@ -318,7 +347,7 @@ struct GpuEmitter {
                 auto i = (IntLit *)n;
                 return IntText(i->val, i->exprtype, n->line);
             }
-            case NK_FltLit: return FltText(((FltLit *)n)->val, n->exprtype, n->line);
+            case NK_FltLit: return FltText(((FltLit *)n)->val, LitFloatType(n), n->line);
             case NK_BoolLit: return ((BoolLit *)n)->val ? "true" : "false";
             case NK_Ident: return IdentX((Ident *)n);
             case NK_Unary: return UnaryX((Unary *)n);
@@ -415,6 +444,8 @@ struct GpuEmitter {
     }
 
     string UnaryX(Unary *u) {
+        double folded;
+        if (u->litfloat && FoldLitFloat(u, folded)) return FltText(folded, LitFloatType(u), u->line);
         if (u->op == T_BITAND) {
             if (u->exprtype && u->exprtype->kind != TY_REF) return X(u->child);
             Fail(u, "references do not run on the GPU");
@@ -454,6 +485,8 @@ struct GpuEmitter {
     }
 
     string BinaryX(Binary *b) {
+        double folded;
+        if (b->litfloat && FoldLitFloat(b, folded)) return FltText(folded, LitFloatType(b), b->line);
         if (b->op == T_DOTEQ || b->op == T_DOTNEQ) Fail(b, "references do not run on the GPU");
         auto lt = b->left->exprtype, rt = b->right->exprtype;
         auto l = X(b->left);

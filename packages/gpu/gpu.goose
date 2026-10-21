@@ -100,6 +100,23 @@ struct ComputePipeline { id: u32 }
 struct Readback { id: u32 }
 
 extern "goose_gpu_open" fn open_native(flags: i64) -> bool;
+extern "goose_gpu_open_window" fn open_window_native(title: const u8[:], width: i64, height: i64,
+                                                     flags: i64) -> bool;
+extern "goose_gpu_frame" fn frame() -> bool;
+extern "goose_gpu_poll" fn poll();
+extern "goose_gpu_quit" fn quit();
+extern "goose_gpu_set_title" fn set_title(title: const u8[:]);
+extern "goose_gpu_screen" fn screen_native() -> u32;
+extern "goose_gpu_screen_depth" fn screen_depth_native() -> u32;
+extern "goose_gpu_screen_size" fn screen_size_native(out: i32[:]);
+extern "goose_gpu_begin_screen" fn begin_screen_native(r: f32, g: f32, b: f32, a: f32) -> bool;
+extern "goose_gpu_time" fn time() -> f64;
+extern "goose_gpu_delta_time" fn delta_time() -> f64;
+extern "goose_gpu_frame_count" fn frame_count() -> i64;
+extern "goose_gpu_key_down" fn key_down(name: const u8[:]) -> bool;
+extern "goose_gpu_key_pressed" fn key_pressed(name: const u8[:]) -> bool;
+extern "goose_gpu_mouse_position" fn mouse_position_native(out: f32[:]);
+extern "goose_gpu_mouse_down" fn mouse_down(button: i64) -> bool;
 extern "goose_gpu_close" fn close();
 extern "goose_gpu_error" fn error_native(out: u8[>..]&);
 extern "goose_gpu_driver" fn driver_native(out: u8[>..]&);
@@ -139,6 +156,45 @@ extern "goose_gpu_release_readback" fn release_readback_native(id: u32);
 // A device with no window, for compute, rendering to textures, and tests.
 // GOOSE_GPU_BACKEND=vulkan picks Vulkan over Metal on a Mac.
 fn open_headless() -> bool { open_native(0) }
+
+// gfx's window flags.
+let WINDOW_RESIZABLE = 1;
+let WINDOW_HIDDEN = 2;
+let WINDOW_FULLSCREEN = 4;
+let NO_VSYNC = 16;
+
+// A window and the device drawing into it, as gfx's (§3): frame() shows
+// what was drawn into screen(), and says false once the window is asked to
+// close. With GOOSE_GPU_HEADLESS=1 there is no window, and the screen is a
+// render target of the size asked for.
+fn open(title: const u8[:], width: i64, height: i64) -> bool {
+    open_window_native(title, width, height, 0)
+}
+fn open(title: const u8[:], width: i64, height: i64, flags: i64) -> bool {
+    open_window_native(title, width, height, flags)
+}
+
+// The screen this frame draws into, in ACCESS_NONE until a barrier or
+// begin_screen moves it; frame() shows it from whatever access it is left
+// in. Its depth target is the screen's size.
+fn screen() -> Texture { Texture { screen_native() } }
+fn screen_depth() -> Texture { Texture { screen_depth_native() } }
+fn screen_size() -> int2 {
+    var wh: i32[2] = [0, 0];
+    screen_size_native(wh);
+    int2 { wh[0], wh[1] }
+}
+
+// A pass over the screen and its depth, both cleared, the barriers that put
+// them there placed for the program.
+fn begin_screen(clear: float4) -> bool { begin_screen_native(clear.x, clear.y, clear.z, clear.w) }
+
+// In the window's pixels from its top left.
+fn mouse_position() -> float2 {
+    var xy: f32[2] = [0.0, 0.0];
+    mouse_position_native(xy);
+    float2 { xy[0], xy[1] }
+}
 
 // Why the last failing call failed.
 fn error() -> u8[>..] {

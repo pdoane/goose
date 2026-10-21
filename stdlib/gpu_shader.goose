@@ -9,6 +9,7 @@
 namespace gpu;
 
 import vec;
+import math;
 
 // A compute entry's invocation: its index in the whole dispatch, its
 // group's, and its own within the group (flat, and per axis).
@@ -76,3 +77,61 @@ let mat4_identity = mat4 { float4 { 1.0, 0.0, 0.0, 0.0 }, float4 { 0.0, 1.0, 0.0
 
 fn mul(m: mat4, v: float4) -> float4 { m.c0 * v.x + m.c1 * v.y + m.c2 * v.z + m.c3 * v.w }
 fn mul(a: mat4, b: mat4) -> mat4 { mat4 { mul(a, b.c0), mul(a, b.c1), mul(a, b.c2), mul(a, b.c3) } }
+
+// Transforms, as gfx's: right-handed, looking down -z, to a clip space with
+// y up and depth from 0 at `near` to 1 at `far`. They run on the CPU and
+// the GPU alike.
+fn translate(t: float3) -> mat4 {
+    var m = mat4_identity;
+    m.c3 = float4 { t.x, t.y, t.z, 1.0 };
+    m
+}
+
+fn scale(s: float3) -> mat4 {
+    mat4 { c0: float4 { s.x, 0.0, 0.0, 0.0 }, c1: float4 { 0.0, s.y, 0.0, 0.0 },
+           c2: float4 { 0.0, 0.0, s.z, 0.0 }, c3: float4 { 0.0, 0.0, 0.0, 1.0 } }
+}
+
+// A rotation of `angle` radians about `axis`, counterclockwise looking down
+// the axis.
+fn rotate(axis: float3, angle: f32) -> mat4 {
+    let a = normalize(axis);
+    let c = cos(angle);
+    let s = sin(angle);
+    let k = 1.0 - c;
+    mat4 { c0: float4 { c + a.x * a.x * k, a.y * a.x * k + a.z * s, a.z * a.x * k - a.y * s, 0.0 },
+           c1: float4 { a.x * a.y * k - a.z * s, c + a.y * a.y * k, a.z * a.y * k + a.x * s, 0.0 },
+           c2: float4 { a.x * a.z * k + a.y * s, a.y * a.z * k - a.x * s, c + a.z * a.z * k, 0.0 },
+           c3: float4 { 0.0, 0.0, 0.0, 1.0 } }
+}
+
+fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> mat4 {
+    let f = 1.0 / tan(fovy * 0.5);
+    mat4 { c0: float4 { f / aspect, 0.0, 0.0, 0.0 }, c1: float4 { 0.0, f, 0.0, 0.0 },
+           c2: float4 { 0.0, 0.0, far / (near - far), -1.0 },
+           c3: float4 { 0.0, 0.0, near * far / (near - far), 0.0 } }
+}
+
+fn ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> mat4 {
+    mat4 { c0: float4 { 2.0 / (right - left), 0.0, 0.0, 0.0 },
+           c1: float4 { 0.0, 2.0 / (top - bottom), 0.0, 0.0 },
+           c2: float4 { 0.0, 0.0, 1.0 / (near - far), 0.0 },
+           c3: float4 { (left + right) / (left - right), (top + bottom) / (bottom - top),
+                        near / (near - far), 1.0 } }
+}
+
+fn look_at(eye: float3, target: float3, up: float3) -> mat4 {
+    let f = normalize(target - eye);
+    let s = normalize(cross(f, up));
+    let u = cross(s, f);
+    mat4 { c0: float4 { s.x, u.x, -f.x, 0.0 }, c1: float4 { s.y, u.y, -f.y, 0.0 },
+           c2: float4 { s.z, u.z, -f.z, 0.0 },
+           c3: float4 { -dot(s, eye), -dot(u, eye), dot(f, eye), 1.0 } }
+}
+
+// Four bytes, low first, as numbers from 0 to 1: a color the GPU reads
+// packed in a u32, as GPU functions compute in 32-bit numbers only (§5.2).
+fn unpack_unorm4x8(c: u32) -> float4 {
+    let scale: f32 = 1.0 / 255.0;
+    float4 { c & 255, (c >> 8) & 255, (c >> 16) & 255, (c >> 24) & 255 } * scale
+}

@@ -18,6 +18,10 @@
    buffer committed ahead of the next submission. */
 
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#ifdef GOOSE_GPU_SDL
+#include <SDL3/SDL.h>
+#endif
 
 #include "gpu_internal.h"
 
@@ -45,6 +49,12 @@ static uint64_t uniformgen = UINT64_MAX;
 static id<MTLBuffer> buffers[GOOSE_GPU_HEAP_SLOTS];
 static id<MTLTexture> textures[GOOSE_GPU_HEAP_SLOTS];
 static uint64_t submitted;
+
+/* The window's layer, and the drawable the screen holds this frame. */
+static void *metalview, *sdlwindow;
+static CAMetalLayer *layer;
+static id<CAMetalDrawable> drawable;
+static int drawablewaited;
 
 /* Command allocators, each free again once its submission's fence has
    passed. */
@@ -140,7 +150,7 @@ static int make_samplers(void) {
     return 1;
 }
 
-static int mtl_open(void) {
+static int mtl_open(void *window, int vsync) {
     device = MTLCreateSystemDefaultDevice();
     if (!device) {
         goose_gpu_fail("no Metal device");
@@ -188,11 +198,56 @@ static int mtl_open(void) {
     submitted = 0;
     ringhead = ringcmdstart = 0;
     uniformgen = UINT64_MAX;
+    if (!window) return 1;
+#ifdef GOOSE_GPU_SDL
+    sdlwindow = window;
+    metalview = SDL_Metal_CreateView((SDL_Window *)window);
+    layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(metalview);
+    if (!layer) {
+        goose_gpu_fail("SDL made no Metal layer: %s", SDL_GetError());
+        return 0;
+    }
+    layer.device = device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = NO;      /* a screenshot reads it back */
+    layer.displaySyncEnabled = vsync ? YES : NO;
+    [queue addResidencySet:layer.residencySet];
+    return 1;
+#else
+    (void)vsync;
+    goose_gpu_fail("no SDL: no window");
+    return 0;
+#endif
+}
+
+static int mtl_acquire(uint32_t slot, int *width, int *height) {
+#ifdef GOOSE_GPU_SDL
+    /* The layer follows the window's size in pixels. */
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels((SDL_Window *)sdlwindow, &w, &h);
+    if (w <= 0 || h <= 0) return 0;
+    if (layer.drawableSize.width != w || layer.drawableSize.height != h)
+        layer.drawableSize = CGSizeMake(w, h);
+#endif
+    drawable = [layer nextDrawable];
+    if (!drawable) return 0;
+    drawablewaited = 0;
+    textures[slot] = drawable.texture;
+    ((uint64_t *)heap.contents)[slot] = drawable.texture.gpuResourceID._impl;
+    *width = (int)drawable.texture.width;
+    *height = (int)drawable.texture.height;
     return 1;
 }
 
 static void mtl_close(void) {
     mtl_wait(submitted);
+    drawable = nil;
+    if (layer && queue) [queue removeResidencySet:layer.residencySet];
+    layer = nil;
+#ifdef GOOSE_GPU_SDL
+    if (metalview) SDL_Metal_DestroyView(metalview);
+#endif
+    metalview = NULL;
     render = nil;
     compute = nil;
     uploadenc = nil;
@@ -695,7 +750,7 @@ static void mtl_readback_release(void *rb) {
     free(rb);
 }
 
-static uint64_t mtl_submit(void) {
+static uint64_t mtl_submit(int present) {
     begin();
     [cmd endCommandBuffer];
     id<MTL4CommandBuffer> list[2];
@@ -712,8 +767,18 @@ static uint64_t mtl_submit(void) {
         residencydirty = 0;
     }
     uint64_t fence = submitted + 1;
+    /* The display done with the drawable before anything drawing into it. */
+    if (drawable && !drawablewaited) {
+        [queue waitForDrawable:drawable];
+        drawablewaited = 1;
+    }
     [queue commit:list count:n];
     [queue signalEvent:event value:fence];
+    if (present && drawable) {
+        [queue signalDrawable:drawable];
+        [drawable present];
+        drawable = nil;
+    }
     allocators[curalloc].fence = fence;
     if (uploadalloc >= 0) allocators[uploadalloc].fence = fence;
     for (int i = 0; i < npending; i++) {
@@ -737,5 +802,5 @@ const goose_gpu_backend goose_gpu_metal = {
     mtl_dispatch, mtl_draw, mtl_index_buffer, mtl_viewport, mtl_scissor,
     mtl_barrier,
     mtl_readback_buffer, mtl_readback_texture, mtl_readback_read, mtl_readback_release,
-    mtl_submit, mtl_completed, mtl_wait,
+    mtl_acquire, mtl_submit, mtl_completed, mtl_wait,
 };
