@@ -9,6 +9,7 @@ namespace goose {
 // The block is a region a stack it grows outside every loop can be cached
 // over (TopW), rather than the whole body.
 inline void CodeGen::GenBlockInner(Block *b, Dst d, size_t first, int exitscope) {
+    DebugBlock debugblock(*this, b->end);
     auto region = MarkBlockBegin();
     for (auto i = first; i < b->stmts.size(); ++i) GenStmt(b->stmts[i]);
     if (b->tail && !IsVoidT(b->tail->exprtype) && d.k != DK_DISCARD) {
@@ -40,6 +41,9 @@ inline size_t CodeGen::GenInlineArgs(Block *b) {
 inline void CodeGen::GenStmt(Node *n) {
     PushSc(SC_STMT);
     termjump = false;
+    // What a `for` or `match` binds lasts as long as it does; a declaration's
+    // variable, as long as the block around it.
+    DebugBlock debugstatement(*this, Is<VarDecl>(n) ? Line {} : n->end);
     GenStmt2(n);
     if (termjump) {   // Nothing runs after a jump.
         cscopes.back().saves.clear();
@@ -485,6 +489,7 @@ inline string CodeGen::AtLeastLeft(TypeExpr *ct, const string &hi, const string 
 // One copy of a loop's body, from its statement `first` on, in the C loop the
 // caller opened, ending where a continue in it lands.
 inline void CodeGen::GenBodyCopy(Block *bodyb, int si, size_t first) {
+    DebugBlock debugblock(*this, bodyb->end);
     for (auto i = first; i < bodyb->stmts.size(); i++) GenStmt(bodyb->stmts[i]);
     if (bodyb->tail) GenStmt(bodyb->tail);
     EmitRestores(cscopes[si]);
@@ -674,6 +679,7 @@ inline void CodeGen::BindLocal(VarDef *d, Node *init, bool forlocal) {
     }
     auto name = LocalName(d);
     auto t = d->type;
+    debugscopeends[d] = debugblockend;
     if (IsRoot(t)) {
         auto sl = Is<StructLit>(init);
         assert(sl && sl->sinst->st->isroot);

@@ -21,6 +21,15 @@ struct ProcessResult {
 // live line (progress.h) sees it.
 ProcessResult RunProcess(const vector<string> &argv, const string &cwd = "", bool echo = false);
 
+// A program this process talks to over pipes: `in` is its stdin and `out` its
+// stdout. Its stderr is read and dropped, so that it never fills. The program ends
+// with this process.
+struct PipedProcess {
+    FILE *in = nullptr;
+    FILE *out = nullptr;
+    bool Start(const vector<string> &argv);
+};
+
 // The full path of the program `name` on PATH, or on `path` (a list in PATH's
 // form) where that is given, or "" when there is none. On Windows a name
 // without an extension is tried with the ones PATHEXT lists (.exe, .cmd,

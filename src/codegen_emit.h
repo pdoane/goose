@@ -704,6 +704,7 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
         Append(fnbody, "    uint8_t *", p.second, " = ", gnames[p.first], ".base;\n");
     fnbody += bodyout;
     auto name = er ? ernames[sp] : curinfo->cname;
+    RecordDebugFunction(sp, name);
     if (sp->sf->issimd) {
         EmitSimdVersions(sp, name, params, fnbody);
         code += DebugLine({ 1, -1, 0 });

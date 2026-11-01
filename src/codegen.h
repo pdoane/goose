@@ -677,6 +677,25 @@ struct CodeGen {
         body += '\n';
     }
 
+    // What the debug adapter is told (codegen_debugmap.h).
+    map<TypeExpr *, int> debugtypeids;
+    map<string, int> debugtypekeys;
+    vector<string> debugtypes;
+    map<string, string> debugfunctions;
+    int debugblockend = 0;                 // The line the block being generated ends on.
+    unordered_map<const VarDef *, int> debugscopeends;
+    vector<const VarDef *> debugconstants;  // Of the function being generated.
+    vector<pair<TypeExpr *, string>> debugqueues;
+    struct DebugBlock {
+        CodeGen &cg;
+        int saved;
+        DebugBlock(CodeGen &c, Line end) : cg(c), saved(c.debugblockend) { if (end.line > 0) cg.debugblockend = end.line; }
+        ~DebugBlock() { cg.debugblockend = saved; }
+    };
+    int DebugTypeId(TypeExpr *t);
+    void RecordDebugFunction(FnSpec *sp, const string &cname);
+    string DebugMap();
+
     string T() { return cat("t", tmpn++); }
     string Lbl() { return cat("L", tmpn++); }
 

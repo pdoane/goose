@@ -51,10 +51,12 @@
 #include "native.h"
 #include "format.h"
 #include "lsp_rpc.h"
+#include "codegen_debugmap.h"
 #include "lsp_analysis.h"
 #include "lsp_workspace.h"
 #include "lsp_features.h"
 #include "lsp.h"
+#include "dap.h"
 
 namespace goose {
 
@@ -702,6 +704,7 @@ Commands:
   toolchain  Report the C compiler, cmake and git found, and GOOSE_HOME.
   version    Print the compiler's version (or --version).
   lsp        Serve an editor over the Language Server Protocol.
+  dap        Serve a debugger client over the Debug Adapter Protocol.
   completion Print a shell's completion script for goose.
   help       Print this (or --help, -h); with a command, that command's help.
 
@@ -802,6 +805,15 @@ Exit status:
   1                     --check found a file that is not.
   2                     A file does not parse or cannot be read or written,
                         or an option is wrong.
+)";
+    if (topic == "dap") return
+R"(usage: goose dap [--lldb-dap path]
+
+Serves a debugger client over the Debug Adapter Protocol on stdin and stdout.
+A launch whose program is a .goose file builds it with goose build --debug -O0
+and debugs it with lldb-dap, found through --lldb-dap, GOOSE_LLDB_DAP, xcrun on
+macOS or PATH, showing Goose lines, names and values. A failed --debug check
+stops the program as an exception, on the line that failed.
 )";
     if (topic == "lsp") return
 R"(usage: goose lsp [--stdio] [--stdlib dir]
@@ -1035,7 +1047,7 @@ CodeGen::StackConfig StackConfigOf(const vector<string> &cdefines) {
 
 // The commands, in the order the help lists them.
 static const char *const VERBS[] = { "run", "build", "check", "fetch", "format", "toolchain",
-                                     "version", "lsp", "completion", "help" };
+                                     "version", "lsp", "dap", "completion", "help" };
 
 // The edit distance between two words, for the command a mistyped one meant.
 static size_t EditDistance(string_view a, string_view b) {
@@ -1339,6 +1351,7 @@ int Main(int argc, char **argv) {
         return 0;
     }
     if (verb == "lsp") return RunLsp(exe, vector<string>(argv + firstarg, argv + argc));
+    if (verb == "dap") return RunDap(exe, vector<string>(argv + firstarg, argv + argc));
     if (verb == "format") return RunFormat(vector<string>(argv + firstarg, argv + argc));
     string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile;
     auto dump = false, dumpdocs = false, tokens = false, parseonly = false, specs = false;
@@ -1628,7 +1641,7 @@ int Main(int argc, char **argv) {
         TypeCheckProgram(ast, library, nocgen);
         // The checker reported the errors it went on past, root by root.
         if (!ast.errors.empty()) return 1;
-        Optimizer opt(ast, optlevel);
+        Optimizer opt(ast, optlevel, debug && verb == "build");
         if (specs) {
             string s;
             opt.DumpSpecs(s);
@@ -1692,6 +1705,8 @@ int Main(int argc, char **argv) {
             if (string_view(rf.name) == "runtime_ext.h") runtime_ext_text = rf.text;
         auto stackcfg = StackConfigOf(cdefines);
         CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
+        if (verb == "build" && debug)
+            WriteFileMakingDirs(cat(builddir, "/", PathStem(outfile), ".debug.json"), cg.DebugMap());
         if (stacks) cg.StackReport(msgs, stackcfg);
         // The packages whose native parts the program needs, which a JIT
         // run takes functions from and a build links: its own, when it has

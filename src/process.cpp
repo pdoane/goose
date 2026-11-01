@@ -30,6 +30,26 @@
 
 namespace goose {
 
+bool PipedProcess::Start(const vector<string> &argv) {
+    vector<const char *> args;
+    for (auto &a : argv) args.push_back(a.c_str());
+    args.push_back(nullptr);
+    auto options = subprocess_option_inherit_environment | subprocess_option_search_user_path |
+                   subprocess_option_no_window;
+    auto p = new subprocess_s;
+    if (subprocess_create_ex(args.data(), options, nullptr, nullptr, p)) {
+        delete p;
+        return false;
+    }
+    in = subprocess_stdin(p);
+    out = subprocess_stdout(p);
+    thread([err = subprocess_stderr(p)] {
+        char buf[4096];
+        while (fread(buf, 1, sizeof buf, err) > 0) {}
+    }).detach();
+    return true;
+}
+
 ProcessResult RunProcess(const vector<string> &argv, const string &cwd, bool echo) {
     ProcessResult r;
     vector<const char *> args;

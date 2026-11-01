@@ -1109,7 +1109,7 @@ class Runner:
         # naming the shape (optimize_loops.h, BCE's lenbound). Every shape_
         # function of the fixture must have the one it is named for, and no
         # keep_ function any.
-        text = re.sub(r'^#if GS_DEBUG\n#line \d+ "(?:[^"\\]|\\.)*"\n#endif\n',
+        text = re.sub(r'^#if GS_DEBUG\n[^\n]*\n#endif\n',
                       '', text, flags=re.MULTILINE)
         bodies = {}
         texts = {}
@@ -1512,7 +1512,7 @@ def main():
     # of the goose_in_goose bootstrap are exercised through their entry points.
     # The lsp/ fixtures are the language server's, driven by lsp_protocol.py.
     tests = [f for f in sorted(HERE.glob("*/*.goose"))
-             if f.parent.name not in ("errors", "errors_tc", "goose_in_goose", "lsp") and
+             if f.parent.name not in ("errors", "errors_tc", "goose_in_goose", "lsp", "dap") and
              f.name != "lexer_tokens.goose"]
     if len({f.stem for f in tests}) != len(tests):
         ap.error("fixture names must be unique across categories (shared expected/ and build outputs)")
@@ -2333,7 +2333,7 @@ def main():
         checks.append(("--help", code == 0 and "build" in overview and
                        "--multi-test" not in overview, overview + err))
         pages = overview
-        for cmd in ["run", "build", "check", "fetch", "format", "toolchain", "version", "lsp",
+        for cmd in ["run", "build", "check", "fetch", "format", "toolchain", "version", "lsp", "dap",
                     "completion"]:
             code, out, err = tc.run_capture([exe, cmd, "--help"])
             checks.append((f"{cmd} --help", code == 0 and
@@ -2512,6 +2512,22 @@ def main():
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
             r.fail("format --verify", str(e))
     r.show_task(format_sweep)
+
+    def dap_protocol():
+        from dap_protocol import check_dap_protocol, check_values, check_threads, check_unwind
+        import shutil as _shutil
+        if sys.platform != "darwin" and not _shutil.which("lldb-dap"):
+            r.ok("debug adapter: skipped, no lldb-dap")
+            return
+        try:
+            check_dap_protocol(exe, gendir)
+            check_values(exe, gendir)
+            check_threads(exe, gendir)
+            check_unwind(exe, gendir)
+            r.ok("debug adapter: breakpoints, Goose names and values, stepping past generated code, failed checks")
+        except Exception as e:
+            r.fail(f"debug adapter: {e}")
+    r.show_task(dap_protocol)
 
     def lsp_protocol():
         from lsp_protocol import check_lsp_protocol

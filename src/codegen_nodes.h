@@ -810,6 +810,13 @@ inline void AliasDecl::CgAny(CodeGen &cg, const Dst &) { cg.Fail(line, "internal
 // ---- CgStmt ---------------------------------------------------------------
 
 inline void VarDecl::CgStmt(CodeGen &cg) {
+    // A named constant has no storage for a debugger to read; it has a value.
+    for (auto d : defs) {
+        if (d && d->constlit) {
+            cg.debugconstants.push_back(d);
+            cg.debugscopeends[d] = cg.debugblockend;
+        }
+    }
     // Multi-name binding from one call: wire the call's channels straight
     // into the locals.
     if (names.size() > 1 && inits.size() == 1) {

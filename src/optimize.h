@@ -477,7 +477,7 @@ struct Optimizer {
             if (vd->names.size() == 1 && vd->inits.size() == 1 && vd->defs.size() == 1) {
                 auto d = vd->defs[0];
                 auto lit = AsLiteral(vd->inits[0]);
-                if (lit && Unwritten(facts, d)) {
+                if (lit && Unwritten(facts, d) && !keepvars) {
                     consts[d] = lit;
                     // Uses outside this walk exist only via capture; otherwise
                     // every use gets replaced and the binding is dead.
@@ -592,7 +592,9 @@ struct Optimizer {
     // ------------------------------------------------------------------
     // Driver: constructing the Optimizer runs the whole pass.
 
-    Optimizer(Ast &_ast, int level) : ast(_ast) {
+    bool keepvars = false;   // --debug: a variable stays one, for a debugger to read.
+
+    Optimizer(Ast &_ast, int level, bool _keepvars = false) : ast(_ast), keepvars(_keepvars) {
         switch (level) {
             case 0:  nc = 0;  ncu = 0;  break;
             case 1:  nc = 8;  ncu = 48; break;
@@ -1129,7 +1131,7 @@ inline Node *FnDecl::Opt(Optimizer &) { return this; }   // Inert statement.
 inline Node *Ident::Opt(Optimizer &o) {
     if (vdef) {
         auto it = o.consts.find(vdef);
-        if (it != o.consts.end()) {
+        if (it != o.consts.end() && !o.keepvars) {
             o.propagated++;
             return o.CloneLit(it->second, exprtype);
         }
