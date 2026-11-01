@@ -428,6 +428,7 @@ inline void CodeGen::EmitRenderFn(RenderFnReq r) {
     code += decls;
     code += body;
     code += "}\n\n";
+    code += DebugLine({ 1, -1, 0 });
 }
 
 // Where a rendered argument lies: where GenLoc addresses it, but a call's

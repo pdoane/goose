@@ -691,7 +691,7 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
     auto bodyout = ExpandTopMarkers(body, plan);
     assert(bodyout.find("@@gs") == string::npos);
     auto decls = HoistAggregateDecls(bodyout);
-    string fnbody = paramcopies + decls;
+    string fnbody = DebugLine({ 1, -1, 0 }) + paramcopies + decls;
     // A whole-body cache loads at entry; a per-loop one declares and loads
     // itself at its loop's edge.
     for (size_t i = 0; i < toporder.size(); i++)
@@ -704,9 +704,12 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
         Append(fnbody, "    uint8_t *", p.second, " = ", gnames[p.first], ".base;\n");
     fnbody += bodyout;
     auto name = er ? ernames[sp] : curinfo->cname;
-    if (sp->sf->issimd) EmitSimdVersions(sp, name, params, fnbody);
-    else Append(code, "static ", FnAttrs(sp), SigRet(sp), " ", name, "(", params, ") {\n", fnbody,
-                "}\n\n");
+    if (sp->sf->issimd) {
+        EmitSimdVersions(sp, name, params, fnbody);
+        code += DebugLine({ 1, -1, 0 });
+    }
+    else Append(code, DebugLine(sp->sf->line), "static ", FnAttrs(sp), SigRet(sp), " ", name, "(", params, ") {\n", fnbody,
+                "}\n\n", DebugLine({ 1, -1, 0 }));
     curspec = nullptr;
     curinfo = nullptr;
     emiter = false;
@@ -930,6 +933,7 @@ inline void CodeGen::EmitGlobalInit() {
     code += decls;
     code += body;
     code += "}\n\n";
+    code += DebugLine({ 1, -1, 0 });
 }
 
 // x, a pure expression, as a value of index or bound type t: checked below
