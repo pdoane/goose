@@ -1,0 +1,2 @@
+// The sidecar of mixed.goose: its C.
+c_sources = ["mixed_c.c"];

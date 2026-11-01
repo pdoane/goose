@@ -813,7 +813,9 @@ Serves a debugger client over the Debug Adapter Protocol on stdin and stdout.
 A launch whose program is a .goose file builds it with goose build --debug -O0
 and debugs it with lldb-dap, found through --lldb-dap, GOOSE_LLDB_DAP, xcrun on
 macOS or PATH, showing Goose lines, names and values. A failed --debug check
-stops the program as an exception, on the line that failed.
+stops the program as an exception, on the line that failed. C the program lists
+in c_sources is debugged as C: its frames stand between the Goose frames, and
+stepping crosses between the two.
 )";
     if (topic == "lsp") return
 R"(usage: goose lsp [--stdio] [--stdlib dir]

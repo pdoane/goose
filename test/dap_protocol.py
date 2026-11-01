@@ -267,10 +267,63 @@ def check_unwind(exe, workdir):
         c.close()
 
 
+def check_mixed(exe, workdir):
+    """A program's own C stands in the stack between its Goose frames, shows lldb's
+    values and evaluates as C; a step crosses the boundary each way, through an
+    `export fn`'s wrapper; and a signal in C stops on the C line."""
+    for name in ("mixed.goose", "mixed_c.c", "mixed.build"):
+        (Path(workdir) / name).write_text((HERE / "dap" / name).read_text())
+    src = Path(workdir).resolve() / "mixed.goose"
+    csrc = Path(workdir).resolve() / "mixed_c.c"
+    clines = csrc.read_text().split("\n")
+    at = lambda text: next(i for i, l in enumerate(clines) if text in l) + 1
+    c = Client(exe)
+    watchdog = threading.Timer(90, c.close)
+    watchdog.start()
+    try:
+        c.request("initialize", {"adapterID": "goose"})
+        launch = c.send("launch", {"program": str(src)})
+        c.wait_event("initialized")
+        c.request("setBreakpoints", {"source": {"path": str(csrc)}, "breakpoints": [{"line": at("twice = goose_twice(")}]})
+        c.request("configurationDone")
+        c.wait_response(launch)
+        thread = c.wait_event("stopped")["body"]["threadId"]
+        frames = top(c, thread)
+        assert [(f["name"], Path(f["source"]["path"]).name) for f in frames] == [("walk", "mixed_c.c"), ("main", "mixed.goose")], frames
+        vs = locals_of(c, frames[0]["id"])
+        assert vs["n"]["type"] == "int32_t" and vs["n"]["value"] == "21", vs
+        assert locals_of(c, frames[1]["id"])["base"]["type"] == "i32", frames
+        r = c.request("evaluate", {"expression": "n + 1", "frameId": frames[0]["id"], "context": "repl"})
+        assert r["body"]["result"] == "22", r
+        r = c.request("evaluate", {"expression": "base", "frameId": frames[1]["id"], "context": "repl"})
+        assert r["body"]["result"] == "21", r
+        assert c.request("threads")["body"]["threads"][0]["name"].startswith("main: in walk, line"), "thread name"
+
+        c.request("setBreakpoints", {"source": {"path": str(csrc)}, "breakpoints": []})
+        c.request("stepIn", {"threadId": thread})
+        c.wait_event("stopped")
+        assert [f["name"] for f in top(c, thread)] == ["twice", "walk", "main"], "into Goose from C"
+        c.request("stepOut", {"threadId": thread})
+        c.wait_event("stopped")
+        assert [f["name"] for f in top(c, thread)] == ["walk", "main"], "back into C"
+
+        c.request("continue", {"threadId": thread})
+        stop = c.wait_event("stopped")["body"]
+        assert stop["reason"] == "exception", stop
+        frames = top(c, thread)
+        assert (frames[0]["name"], frames[0]["line"]) == ("crash", at("return *nowhere")), frames
+        assert frames[-1]["name"] == "main", frames
+        assert c.request("exceptionInfo", {"threadId": thread})["body"]["description"], "signal text"
+    finally:
+        watchdog.cancel()
+        c.close()
+
+
 if __name__ == "__main__":
     import sys
     check_dap_protocol(sys.argv[1], sys.argv[2])
     check_values(sys.argv[1], sys.argv[2])
     check_threads(sys.argv[1], sys.argv[2])
     check_unwind(sys.argv[1], sys.argv[2])
+    check_mixed(sys.argv[1], sys.argv[2])
     print("ok")

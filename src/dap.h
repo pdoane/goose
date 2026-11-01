@@ -8,6 +8,10 @@
 // the program's values mean comes from the compiler: `goose build --debug` writes a
 // map of each function's locals and each type's layout (codegen_debugmap.h), and
 // the adapter reads values out of memory by their Goose types.
+//
+// C the program brings along (`c_sources`) is debugged as itself: its frames stand
+// in the stack between the Goose frames, with lldb's view of their values, and a
+// step crosses the boundary in either direction.
 #pragma once
 
 namespace goose {
@@ -113,6 +117,8 @@ struct DapAdapter {
     int64_t childseq = 1000000, clientseq = 1;
     map<int64_t, Json> forwarded; // The client's requests in flight, by the seq they went to lldb under.
 
+    string programdir;            // The Goose source's directory: C under it is the program's own.
+
     // This stop.
     string cwd;
     int64_t failedthread = 0;
@@ -120,6 +126,7 @@ struct DapAdapter {
     int failureline = 0;
     struct Frame { string source; int line = 0; string function; bool mainthread = false; };
     map<int64_t, Frame> frames;
+    set<int64_t> cframes;                 // The frames in the program's own C: lldb describes them.
     map<int64_t, int64_t> scopeframes;    // A locals scope's reference: its frame.
     map<int64_t, vector<Json>> rendered;  // What a reference expands to.
     struct Lazy { uint64_t addr; int type; string path; };
@@ -566,6 +573,7 @@ struct DapAdapter {
         failureline = 0;
         scopeframes.clear();
         frames.clear();
+        cframes.clear();
         rendered.clear();
         lazy.clear();
         pages.clear();
@@ -598,6 +606,7 @@ struct DapAdapter {
         cwd = args.Str("cwd");
         if (EndsWith(program, ".goose")) {
             auto src = CanonicalPath(program);
+            programdir = DirOf(src);
             auto r = RunProcess({ exe, "build", "--debug", "-O0", src }, DirOf(src));
             if (!r.started || r.code != 0) {
                 Respond(req, false, Object(), cat("goose build failed:\n", r.output));
@@ -627,7 +636,15 @@ struct DapAdapter {
             auto src = f.Get("source") ? f.Get("source")->Str("path") : string();
             auto cname = f.Str("name");
             auto fn = Function(cname);
-            if (!fn) continue;
+            if (!fn) {
+                // The program's own C keeps its name, its source and lldb's view of
+                // its values; what the compiler wrote stays out of sight.
+                if (ProgramC(src)) {
+                    cframes.insert(JsonInt(f, "id"));
+                    out.arr.push_back(std::move(frame));
+                }
+                continue;
+            }
             if (failed && !EndsWith(src, ".goose")) {
                 auto s = Object();
                 JsonSet(s, "name", JsonOfStr(failurefile.substr(failurefile.rfind('/') + 1)));
@@ -673,6 +690,10 @@ struct DapAdapter {
                 auto cname = f.Str("name");
                 if (cname == "gs_qget" || cname == "gs_qwait") waits = "waiting in qget";
                 if (cname == "gs_thread_wait") waits = "waiting in thread_wait";
+                if (inner.empty() && ProgramC(f.Get("source") ? f.Get("source")->Str("path") : string())) {
+                    inner = cname;
+                    line = (int)JsonInt(f, "line");
+                }
                 if (auto fn = Function(cname)) {
                     if (inner.empty()) {
                         inner = fn->Str("name");
@@ -1123,6 +1144,15 @@ struct DapAdapter {
     void EvaluateRequest(const Json &req) {
         auto args = req.Get("arguments") ? *req.Get("arguments") : Object();
         auto id = JsonInt(args, "frameId");
+        if (cframes.count(id)) {
+            // A frame in C reads C. A client's console asks in "repl", which lldb-dap
+            // would take for a debugger command.
+            auto forward = req;
+            JsonSet(args, "context", JsonOfStr("watch"));
+            JsonSet(forward, "arguments", std::move(args));
+            Forward(forward);
+            return;
+        }
         auto it = frames.find(id);
         if (it == frames.end()) {
             if (Functions()) Respond(req, false, Object(), "that frame is not part of the current stop");
@@ -1187,6 +1217,8 @@ struct DapAdapter {
     }
 
     void ExceptionInfo(const Json &req) {
+        // No check failed, so the stop is lldb's: a signal, usually in C.
+        if (failuretext.empty()) { Forward(req); return; }
         auto reply = Object();
         JsonSet(reply, "exceptionId", JsonOfStr("runtime check"));
         JsonSet(reply, "description", JsonOfStr(failuretext));
@@ -1247,8 +1279,17 @@ struct DapAdapter {
         return cwd.empty() || DirOf(path) == (EndsWith(cwd, "/") ? cwd : cwd + "/");
     }
 
+    // C the program brought along, beside its source: not the C the compiler
+    // generated, nor a package's, nor the runtime's.
+    bool ProgramC(const string &path) const {
+        if (programdir.empty() || !StartsWith(path, programdir)) return false;
+        return EndsWith(path, ".c") || EndsWith(path, ".h") || EndsWith(path, ".cc") || EndsWith(path, ".cpp");
+    }
+
     // A stop is the client's to see unless it is inside what the compiler wrote: a
-    // step that lands in generated C or the standard library carries on.
+    // step that lands in generated C or the standard library carries on. The
+    // program's own C is the client's too, and a step from it into an `export fn`'s
+    // wrapper carries on inward, to the Goose the wrapper calls.
     void OnStopped(Json ev) {
         auto body = ev.Get("body") ? *ev.Get("body") : Object();
         auto thread = JsonInt(body, "threadId");
@@ -1289,8 +1330,10 @@ struct DapAdapter {
         if (!raw.empty() && reason == "step") {
             auto s = raw[0].Get("source");
             auto path = s ? s->Str("path") : string();
-            if (!UserFrame(path)) {
-                auto onward = !hasgoose ? "continue" : Function(raw[0].Str("name")) && !EndsWith(path, ".goose") ? "stepIn" : "stepOut";
+            if (!UserFrame(path) && !ProgramC(path)) {
+                auto caller = raw.size() > 1 && raw[1].Get("source") ? raw[1].Get("source")->Str("path") : string();
+                auto inward = (Function(raw[0].Str("name")) && !EndsWith(path, ".goose")) || ProgramC(caller);
+                auto onward = !hasgoose ? "continue" : inward ? "stepIn" : "stepOut";
                 Call(onward, args);
                 return;
             }

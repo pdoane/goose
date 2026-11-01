@@ -2514,7 +2514,7 @@ def main():
     r.show_task(format_sweep)
 
     def dap_protocol():
-        from dap_protocol import check_dap_protocol, check_values, check_threads, check_unwind
+        from dap_protocol import check_dap_protocol, check_values, check_threads, check_unwind, check_mixed
         import shutil as _shutil
         if sys.platform != "darwin" and not _shutil.which("lldb-dap"):
             r.ok("debug adapter: skipped, no lldb-dap")
@@ -2524,7 +2524,8 @@ def main():
             check_values(exe, gendir)
             check_threads(exe, gendir)
             check_unwind(exe, gendir)
-            r.ok("debug adapter: breakpoints, Goose names and values, stepping past generated code, failed checks")
+            check_mixed(exe, gendir)
+            r.ok("debug adapter: breakpoints, Goose names and values, stepping past generated code, failed checks, the program's own C")
         except Exception as e:
             r.fail(f"debug adapter: {e}")
     r.show_task(dap_protocol)
